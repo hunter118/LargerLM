@@ -1,0 +1,18 @@
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.DS_Store
+
+# Model artifacts can be hundreds of GB.
+artifacts/
+*.safetensors
+*.bin
+*.gguf
+experts/
+packed_experts/
+packed_experts_*/
+
+# Local build outputs.
+metal/glm_moe_infer
+metal/largerlm-runner
+metal/prefill-backend-probe
