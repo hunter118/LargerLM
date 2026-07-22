@@ -35,8 +35,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--m5-max-128g-safe",
         action="store_true",
         help=(
-            "Use 44 GiB hard-pinned experts plus a planned 36 GiB evictable "
-            "cache for a 128 GiB M5 Max."
+            "Build the experimental 44 GiB hard-pinned plus 36 GiB adaptive "
+            "upper-bound plan for a 128 GiB M5 Max; the runtime default still "
+            "trusts the macOS page cache."
         ),
     )
     parser.add_argument("--default-layer", type=int)

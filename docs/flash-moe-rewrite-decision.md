@@ -19,6 +19,14 @@ boundaries, and no Python/file handoff inside the token loop.
 
 ## Evidence
 
+The earlier paper behind this direction is Apple's
+[LLM in a Flash: Efficient Large Language Model Inference with Limited Memory](https://arxiv.org/abs/2312.11514).
+It stores weights on flash and transfers only the portions needed by the
+current activation pattern, using sparsity-aware loading and data layout to
+reduce I/O. GLM's routed MoE supplies an exact, model-defined sparse access
+pattern: only the router's top-k experts are needed. LargerLM applies the same
+principle without changing routing or model output.
+
 Flash-MoE's source is a specialized single-process engine. Its hot path keeps
 non-expert weights mmap'd, wraps them as Metal buffers, reads selected expert
 slots via `pread` into 2MB-aligned shared Metal buffers, and batches each

@@ -1112,6 +1112,18 @@ def test_generate_metal_token_ids_defaults_min_free_from_prepared_manifest(
             "system_available_memory_bytes": 10 * 1024**3,
             "required_available_memory_bytes": 4 * 1024**3,
             "expert_buffer_count_runtime_allocated": 1,
+            "expert_resident_cache": {
+                "enabled": True,
+                "entry_count": 12,
+                "pinned_entry_count": 4,
+                "adaptive_allocation_bytes": 2048,
+                "eviction_count": 3,
+                "pressure_reject_count": 2,
+                "system_memory_after_execution": {
+                    "available_bytes": 8 * 1024**3,
+                    "pressure_level": 1,
+                },
+            },
             "probe_generate": {
                 "ok": True,
                 "entry": "generate_token_ids",
@@ -1120,6 +1132,10 @@ def test_generate_metal_token_ids_defaults_min_free_from_prepared_manifest(
                     {
                         "decode_elapsed_seconds": 1.25,
                         "final_logits_elapsed_seconds": 0.1,
+                        "expert_cache_hit_bytes": 4096,
+                        "expert_cache_hit_count": 3,
+                        "expert_cache_miss_count": 5,
+                        "expert_cache_store_count": 2,
                     },
                 ],
             },
@@ -1149,3 +1165,15 @@ def test_generate_metal_token_ids_defaults_min_free_from_prepared_manifest(
     assert result.system_available_memory_bytes == 10 * 1024**3
     assert result.required_available_memory_bytes == 4 * 1024**3
     assert result.expert_buffer_count_allocated == 1
+    assert result.decode_expert_cache_hit_bytes == (4096,)
+    assert result.decode_expert_cache_hit_count == (3,)
+    assert result.decode_expert_cache_miss_count == (5,)
+    assert result.decode_expert_cache_store_count == (2,)
+    assert result.expert_cache_enabled is True
+    assert result.expert_cache_entry_count == 12
+    assert result.expert_cache_pinned_entry_count == 4
+    assert result.expert_cache_adaptive_allocation_bytes == 2048
+    assert result.expert_cache_eviction_count == 3
+    assert result.expert_cache_pressure_reject_count == 2
+    assert result.expert_cache_system_available_memory_after_execution == 8 * 1024**3
+    assert result.expert_cache_memory_pressure_level_after_execution == 1

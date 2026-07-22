@@ -159,6 +159,14 @@ def test_pin_plan_uses_byte_weighted_frequency_and_stays_in_budget(
     assert plan["runtime_consumable"] is True
     assert plan["runtime_cli_flag"] == "--expert-pin-plan"
     assert plan["memory_envelope"]["maximum_expert_resident_gib"] == 80
+    assert plan["memory_envelope"]["default_expert_cache_policy"] == "os_page_cache"
+    assert plan["memory_envelope"]["experimental_upper_bound"] is True
+    assert (
+        plan["memory_envelope"][
+            "unallocated_headroom_at_maximum_expert_residency_gib"
+        ]
+        == 8
+    )
 
 
 def test_cli_writes_m5_max_profile_and_plan(tmp_path: Path) -> None:

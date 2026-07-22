@@ -101,10 +101,13 @@ Metal live cap and a 24 GiB free unified-memory admission guard. Those values
 are conservative; keep them conservative unless you are deliberately measuring a
 new envelope.
 
-The reopened residency plan uses 44 GiB of hard-pinned hot experts and up to 36
-GiB of evictable expert cache. The evictable tier must shrink before the 24 GiB
-free-memory guard is crossed; 80 GiB is a conditional total expert working set,
-not an unconditional pinned allocation.
+The default residency policy is now to trust the macOS page cache. The reopened
+44 GiB hard tier plus 36 GiB adaptive tier remains an experimental upper bound,
+not the recommended launch profile. Application-owned expert buffers consume
+memory that macOS could otherwise use for frequency-aware file caching and can
+increase compression or GPU/SSD contention. The adaptive tier must shrink
+before the 24 GiB free-memory guard is crossed; 80 GiB is a conditional total
+expert working set, not an unconditional pinned allocation.
 
 The Metal runtime also requires the macOS VM-pressure level to be normal. It
 validates the whole hard-pinned allocation before preload, then checks pressure
@@ -134,9 +137,10 @@ metal/glm_moe_infer \
 ```
 
 The larger live cap includes expert residency; it does not mean the runtime
-will allocate 96 GiB immediately. The 44 GiB hard tier is planned, while the
-adaptive tier grows only on misses and remains bounded by both its 36 GiB cap
-and the live memory guards.
+will allocate 96 GiB immediately. Use this command only for the explicit-cache
+benchmark. The baseline omits both expert-cache flags. The 44 GiB hard tier is
+planned, while the adaptive tier grows only on misses and remains bounded by
+both its 36 GiB cap and the live memory guards.
 
 ## Installation
 

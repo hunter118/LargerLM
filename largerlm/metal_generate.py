@@ -105,6 +105,18 @@ class MetalTokenGenerationResult:
     decode_expert_read_max_worker_count: tuple[int, ...] = ()
     decode_expert_read_pool_dispatch_count: tuple[int, ...] = ()
     decode_expert_read_serial_dispatch_count: tuple[int, ...] = ()
+    decode_expert_cache_hit_bytes: tuple[int, ...] = ()
+    decode_expert_cache_hit_count: tuple[int, ...] = ()
+    decode_expert_cache_miss_count: tuple[int, ...] = ()
+    decode_expert_cache_store_count: tuple[int, ...] = ()
+    expert_cache_enabled: bool | None = None
+    expert_cache_entry_count: int | None = None
+    expert_cache_pinned_entry_count: int | None = None
+    expert_cache_adaptive_allocation_bytes: int | None = None
+    expert_cache_eviction_count: int | None = None
+    expert_cache_pressure_reject_count: int | None = None
+    expert_cache_system_available_memory_after_execution: int | None = None
+    expert_cache_memory_pressure_level_after_execution: int | None = None
     decode_mla_value_cache_hit_count: tuple[int, ...] = ()
     decode_mla_value_cache_store_count: tuple[int, ...] = ()
     decode_mla_value_cache_bytes: tuple[int, ...] = ()
@@ -352,6 +364,59 @@ def _mla_kv_b_cache_result_fields(
             payload,
             "mla_kv_b_cache_live_estimate_bytes",
             "executor_mla_kv_b_cache_live_estimate_bytes",
+        ),
+    }
+
+
+def _expert_cache_result_fields(
+    payload: dict[str, Any],
+    steps: object,
+) -> dict[str, Any]:
+    cache = payload.get("expert_resident_cache")
+    if not isinstance(cache, dict):
+        cache = {}
+    memory = cache.get("system_memory_after_execution")
+    if not isinstance(memory, dict):
+        memory = {}
+    return {
+        "decode_expert_cache_hit_bytes": _step_int_tuple(
+            steps,
+            "expert_cache_hit_bytes",
+        ),
+        "decode_expert_cache_hit_count": _step_int_tuple(
+            steps,
+            "expert_cache_hit_count",
+        ),
+        "decode_expert_cache_miss_count": _step_int_tuple(
+            steps,
+            "expert_cache_miss_count",
+        ),
+        "decode_expert_cache_store_count": _step_int_tuple(
+            steps,
+            "expert_cache_store_count",
+        ),
+        "expert_cache_enabled": _payload_bool(cache, "enabled"),
+        "expert_cache_entry_count": _payload_int(cache, "entry_count"),
+        "expert_cache_pinned_entry_count": _payload_int(
+            cache,
+            "pinned_entry_count",
+        ),
+        "expert_cache_adaptive_allocation_bytes": _payload_int(
+            cache,
+            "adaptive_allocation_bytes",
+        ),
+        "expert_cache_eviction_count": _payload_int(cache, "eviction_count"),
+        "expert_cache_pressure_reject_count": _payload_int(
+            cache,
+            "pressure_reject_count",
+        ),
+        "expert_cache_system_available_memory_after_execution": _payload_int(
+            memory,
+            "available_bytes",
+        ),
+        "expert_cache_memory_pressure_level_after_execution": _payload_int(
+            memory,
+            "pressure_level",
         ),
     }
 
@@ -1319,6 +1384,7 @@ def generate_metal_token_ids(
                     steps,
                     "expert_read_serial_dispatch_count",
                 ),
+                **_expert_cache_result_fields(payload, steps),
                 **_mla_kv_b_cache_result_fields(payload, steps),
                 prompt_prefill_elapsed_seconds=prompt_prefill_elapsed,
                 metal_elapsed_seconds=elapsed,
@@ -1590,6 +1656,7 @@ def generate_metal_token_ids(
                         steps,
                         "expert_read_serial_dispatch_count",
                     ),
+                    **_expert_cache_result_fields(payload, steps),
                     **_mla_kv_b_cache_result_fields(payload, steps),
                     note=(
                         "prefill bridge path: uses existing prompt prefill to seed "
@@ -1917,6 +1984,7 @@ def generate_metal_token_ids(
                 steps,
                 "expert_read_serial_dispatch_count",
             ),
+            **_expert_cache_result_fields(payload, steps),
             **_mla_kv_b_cache_result_fields(payload, steps),
             note=(
                 "decode-only path: glm_moe_infer decodes the last prompt token "

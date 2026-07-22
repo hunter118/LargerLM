@@ -86,9 +86,11 @@ Use guarded commands only. Important knobs include:
 The local proof-of-feasibility route used conservative guards such as a 16 GiB
 Metal live cap and a 24 GiB free unified-memory admission guard.
 
-The reopened M5 Max plan uses up to 44 GiB of hard-pinned hot experts plus an
-evictable cache of up to 36 GiB. The 80 GiB total is conditional: the evictable
-tier must shrink before the 24 GiB free-memory guard is crossed.
+The default M5 Max path uses no application-owned expert cache and lets macOS
+manage reusable expert pages. A 44 GiB hard tier plus a 36 GiB adaptive tier is
+available only as an experimental upper-bound comparison. Its adaptive tier
+must shrink before the 24 GiB free-memory guard is crossed; it is not the
+recommended default until a real GLM route replay beats the OS page cache.
 
 Build a no-weight expert profile and pin plan with:
 

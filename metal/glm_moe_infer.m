@@ -3288,9 +3288,25 @@ static int preload_expert_resident_cache(GlmMoeRuntimeContext *runtime) {
 }
 
 static NSDictionary *expert_resident_cache_payload(ExpertResidentCache *cache) {
+    SystemMemorySnapshot snapshot = {0};
+    int snapshotOk = read_system_memory_snapshot(&snapshot);
+    NSDictionary *memory = @{
+        @"ok": @(snapshotOk ? YES : NO),
+        @"available_bytes": snapshotOk
+            ? @(snapshot.available_bytes)
+            : (id)[NSNull null],
+        @"pressure_known": snapshotOk
+            ? @(snapshot.memory_pressure_known ? YES : NO)
+            : (id)[NSNull null],
+        @"pressure_level":
+            (snapshotOk && snapshot.memory_pressure_known)
+                ? @(snapshot.memory_pressure_level)
+                : (id)[NSNull null],
+    };
     if (!cache) {
         return @{
             @"enabled": @(NO),
+            @"system_memory_after_execution": memory,
         };
     }
     return @{
@@ -3319,6 +3335,7 @@ static NSDictionary *expert_resident_cache_payload(ExpertResidentCache *cache) {
         @"store_count": @(cache.storeCount),
         @"eviction_count": @(cache.evictionCount),
         @"pressure_reject_count": @(cache.pressureRejectCount),
+        @"system_memory_after_execution": memory,
     };
 }
 

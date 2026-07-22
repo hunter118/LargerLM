@@ -11,6 +11,15 @@ from pathlib import Path
 from mxfp4_layer_moe_smoke import HIDDEN_DIM, expected_output0, write_fixture
 
 
+def assert_memory_telemetry(payload: dict[str, object]) -> None:
+    cache = payload.get("expert_resident_cache") or {}
+    memory = cache.get("system_memory_after_execution") or {}
+    if not memory.get("ok"):
+        raise SystemExit(f"missing post-execution memory telemetry: {cache}")
+    if not isinstance(memory.get("available_bytes"), int) or memory["available_bytes"] <= 0:
+        raise SystemExit(f"invalid post-execution available memory: {memory}")
+
+
 def run_expert_read_probe(binary: Path, root: Path) -> None:
     cmd = [
         str(binary),
@@ -52,6 +61,7 @@ def run_expert_read_probe(binary: Path, root: Path) -> None:
         raise SystemExit(f"expected no serial expert read dispatch, got {probe}")
     if len(probe.get("results") or []) != 2:
         raise SystemExit(f"expected two read checksums, got {probe}")
+    assert_memory_telemetry(payload)
     print(
         "  direct expert read: "
         f"{probe['expert_read_task_count']} tasks via "
@@ -121,6 +131,7 @@ def run_smoke(binary: Path, root: Path) -> None:
     probe = payload.get("probe_layer_moe") or {}
     if not payload.get("ok") or not probe.get("ok"):
         raise SystemExit("glm_moe_infer layer MoE probe did not report ok")
+    assert_memory_telemetry(payload)
     if probe.get("expert_read_dispatch_count") != 1:
         raise SystemExit(f"expected one expert read dispatch, got {probe}")
     if probe.get("expert_read_task_count") != 2:
@@ -213,6 +224,7 @@ def run_resident_cache_smoke(binary: Path, root: Path) -> None:
     cache = payload.get("expert_resident_cache") or {}
     if not payload.get("ok") or not probe.get("ok") or not cache.get("enabled"):
         raise SystemExit("expert resident cache smoke did not report ok")
+    assert_memory_telemetry(payload)
     expected_cache = {
         "preload_count": 1,
         "entry_count": 2,

@@ -46,10 +46,36 @@ The `m5-max-128g-safe` profile separates expert memory into two tiers:
 - 24 GiB minimum available unified-memory guard.
 
 This permits an 80 GiB expert working set only while memory pressure is low.
-Pinning the full 80 GiB would be unsafe: adding dense weights, Metal/KV scratch,
-the OS, drivers, page tables, and the 24 GiB guard would exceed the machine's
-128 GB capacity. The runtime evicts adaptive entries before crossing the guard
-and refuses execution or new cache allocations if pressure remains high.
+It is an experimental ceiling, not the default. Pinning the full 80 GiB would
+be unsafe: adding dense weights, Metal/KV scratch, the OS, drivers, page tables,
+and the 24 GiB guard would exceed the machine's 128 GB capacity. Even below
+that ceiling, application-owned buffers displace the macOS file cache and can
+make expert reads slower. The runtime evicts adaptive entries before crossing
+the guard and refuses execution or new cache allocations if pressure remains
+high.
+
+## Flash-MoE Cache Result
+
+A fresh review of Flash-MoE's retained fast path changes the benchmark order.
+Its author measured the OS page cache at about a 71% hit rate and found that
+removing a custom Metal LRU improved throughput by 38%. Temporal expert
+prediction was 18% slower, while `F_RDADVISE` reduced expert I/O but increased
+concurrent GPU time by 73% because SSD DMA and Metal share the unified-memory
+fabric. Its final path uses parallel `pread` directly into aligned shared Metal
+buffers, overlaps only work that does not require route prediction, defers the
+expert command buffer, and otherwise trusts macOS.
+
+LargerLM already has the same quality-preserving direct-read, aligned reusable
+buffer, parallel-worker, and deferred-submit foundations. Its custom cache is
+therefore opt-in. Real GLM-5.2 testing must compare, in this order:
+
+1. no application cache, allowing the largest OS page cache;
+2. a smaller learned hot set with a bounded adaptive tier;
+3. the 44+36 GiB upper bound.
+
+The 80 GiB case is retained because GLM routing may be more skewed than
+Flash-MoE's Qwen routing. It wins only if the measured reduction in SSD bytes
+outweighs lost page-cache capacity, memory pressure, and lookup/allocation cost.
 
 ## Usage Profiler And Plan
 
@@ -122,8 +148,8 @@ any layer. Pinned entries are never selected for eviction.
 
 Runtime JSON includes `expert_resident_cache` plus per-layer and aggregate
 `expert_cache_hit_count`, `expert_cache_miss_count`, `expert_cache_hit_bytes`,
-and SSD read counters. These fields are the basis for the later real-model
-decision.
+SSD read counters, and a post-execution available-memory/VM-pressure snapshot.
+These fields are the basis for the later real-model decision.
 
 ## M5 Neural Accelerators
 
@@ -156,8 +182,11 @@ also passes.
 
 Remaining work:
 
-1. Add bounded layer-ahead prefetch without altering selected experts.
-2. Repair/install the Xcode Metal Toolchain and compare direct MPP TensorOps
+1. Finish the GLM-5.2 download and prepare a 4096-token package; this keeps the
+   initial decode cache near 372 MiB instead of about 16 GiB.
+2. Measure the no-cache baseline, then collect complete route telemetry and
+   compare smaller residency plans with the 44+36 GiB upper bound.
+3. Promote a cache policy only when it improves steady-state tok/s without
+   crossing the 24 GiB free-memory guard or raising VM pressure.
+4. Repair/install the Xcode Metal Toolchain and compare direct MPP TensorOps
    against the working MPSGraph prefill path.
-3. Re-download or externally copy GLM-5.2 weights and measure hit rate, SSD
-   bytes/token, prefill time, decode tok/s, and peak memory.
