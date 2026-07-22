@@ -234,9 +234,19 @@ def _metal_token_result(
 class _FakeMetalGenerateServerSession:
     instances: list["_FakeMetalGenerateServerSession"] = []
 
-    def __init__(self, *, binary: Path, prepared_dir: Path, quiet: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        binary: Path,
+        prepared_dir: Path,
+        expert_pin_plan: Path | None = None,
+        max_adaptive_expert_cache_gib: float = 0.0,
+        quiet: bool = True,
+    ) -> None:
         self.binary = Path(binary)
         self.prepared_dir = Path(prepared_dir)
+        self.expert_pin_plan = expert_pin_plan
+        self.max_adaptive_expert_cache_gib = max_adaptive_expert_cache_gib
         self.quiet = quiet
         self.closed = False
         self.request_count = 0
@@ -265,6 +275,42 @@ def test_decode_layer_payload_reports_mla_kv_b_cache_flag(tmp_path: Path) -> Non
 
     assert payload["command_has_mla_kv_b_cache_dir"] is True
     assert payload["command_mla_kv_b_cache_dir"] == str(cache_dir)
+
+
+def test_prepared_server_passes_expert_cache_to_persistent_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared = _write_minimal_prepared_manifest(tmp_path)
+    expert_pin_plan = tmp_path / "expert-pin-plan.json"
+    expert_pin_plan.write_text("{}", encoding="utf-8")
+    _FakeMetalGenerateServerSession.instances = []
+    monkeypatch.setattr(
+        "largerlm.server.MetalGenerateServerSession",
+        _FakeMetalGenerateServerSession,
+    )
+
+    app = PreparedGenerationApp(
+        PreparedServerConfig(
+            prepared_path=prepared,
+            runner_path=Path("unused-runner"),
+            metal_runtime_generation=True,
+            metal_runtime_expert_pin_plan=expert_pin_plan,
+            metal_runtime_max_adaptive_expert_cache_gib=36.0,
+        )
+    )
+    try:
+        session = app._metal_runtime_session()
+        health = app.health()
+
+        assert session.expert_pin_plan == expert_pin_plan.resolve()
+        assert session.max_adaptive_expert_cache_gib == 36.0
+        assert health["metal_runtime_expert_pin_plan"] == str(
+            expert_pin_plan.resolve()
+        )
+        assert health["metal_runtime_max_adaptive_expert_cache_gib"] == 36.0
+    finally:
+        app.close()
 
 
 def _replace_kv_b_with_absorbed_aliases(prepared: Path, *, mxfp4: bool) -> None:

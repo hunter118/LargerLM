@@ -9615,6 +9615,8 @@ def _generate_metal_token_ids(args: argparse.Namespace) -> int:
         prompt_token_ids=_parse_token_ids(args.prompt_token_ids),
         max_new_tokens=args.max_new_tokens,
         binary=args.binary,
+        expert_pin_plan=args.expert_pin_plan,
+        max_adaptive_expert_cache_gib=args.max_adaptive_expert_cache_gib,
         work_dir=args.work_dir,
         keep_work_dir=args.keep_work_dir,
         top_k=args.top_k,
@@ -9705,6 +9707,8 @@ def _generate_metal_text(args: argparse.Namespace) -> int:
         skip_special_tokens=not args.no_skip_special_tokens,
         max_prompt_tokens=args.max_prompt_tokens,
         binary=args.binary,
+        expert_pin_plan=args.expert_pin_plan,
+        max_adaptive_expert_cache_gib=args.max_adaptive_expert_cache_gib,
         work_dir=args.work_dir,
         keep_work_dir=args.keep_work_dir,
         top_k=args.top_k,
@@ -9791,6 +9795,8 @@ def _generate_metal_text_batch(args: argparse.Namespace) -> int:
         trust_remote_code=args.trust_remote_code,
         max_new_tokens=args.max_new_tokens,
         binary=args.binary,
+        expert_pin_plan=args.expert_pin_plan,
+        max_adaptive_expert_cache_gib=args.max_adaptive_expert_cache_gib,
         add_special_tokens=not args.no_add_special_tokens,
         skip_special_tokens=not args.no_skip_special_tokens,
         max_prompt_tokens=args.max_prompt_tokens,
@@ -10501,6 +10507,14 @@ def _prepared_server_config_from_args(args: argparse.Namespace) -> PreparedServe
         ),
         metal_runtime_max_mla_kv_b_cache_mib=float(
             getattr(args, "metal_runtime_max_mla_kv_b_cache_mib", 0.0)
+        ),
+        metal_runtime_expert_pin_plan=(
+            Path(args.metal_runtime_expert_pin_plan)
+            if getattr(args, "metal_runtime_expert_pin_plan", None)
+            else None
+        ),
+        metal_runtime_max_adaptive_expert_cache_gib=float(
+            getattr(args, "metal_runtime_max_adaptive_expert_cache_gib", 0.0)
         ),
         metal_runtime_mmap_final_logits=bool(
             getattr(args, "metal_runtime_mmap_final_logits", False)
@@ -21055,6 +21069,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     metal_gen.add_argument("prepared_dir", help="prepared LargerLM package root")
     metal_gen.add_argument("--binary", default="metal/glm_moe_infer")
+    metal_gen.add_argument(
+        "--expert-pin-plan",
+        default=None,
+        help="quality-preserving expert residency plan for glm_moe_infer",
+    )
+    metal_gen.add_argument(
+        "--max-adaptive-expert-cache-gib",
+        type=float,
+        default=0.0,
+        help="override the plan's evictable expert cache budget",
+    )
     metal_gen.add_argument("--prompt-token-ids", required=True, help="comma-separated token ids")
     metal_gen.add_argument("--max-new-tokens", type=int, required=True)
     metal_gen.add_argument("--top-k", type=int, default=None)
@@ -21167,6 +21192,12 @@ def build_parser() -> argparse.ArgumentParser:
     metal_text.add_argument("--no-add-special-tokens", action="store_true")
     metal_text.add_argument("--no-skip-special-tokens", action="store_true")
     metal_text.add_argument("--binary", default="metal/glm_moe_infer")
+    metal_text.add_argument("--expert-pin-plan", default=None)
+    metal_text.add_argument(
+        "--max-adaptive-expert-cache-gib",
+        type=float,
+        default=0.0,
+    )
     metal_text.add_argument("--max-new-tokens", type=int, required=True)
     metal_text.add_argument("--top-k", type=int, default=None)
     metal_text.add_argument("--logits-top-k", type=int, default=8)
@@ -21278,6 +21309,12 @@ def build_parser() -> argparse.ArgumentParser:
     metal_text_batch.add_argument("--no-add-special-tokens", action="store_true")
     metal_text_batch.add_argument("--no-skip-special-tokens", action="store_true")
     metal_text_batch.add_argument("--binary", default="metal/glm_moe_infer")
+    metal_text_batch.add_argument("--expert-pin-plan", default=None)
+    metal_text_batch.add_argument(
+        "--max-adaptive-expert-cache-gib",
+        type=float,
+        default=0.0,
+    )
     metal_text_batch.add_argument("--max-new-tokens", type=int, required=True)
     metal_text_batch.add_argument("--top-k", type=int, default=None)
     metal_text_batch.add_argument("--logits-top-k", type=int, default=8)
@@ -22332,6 +22369,17 @@ def build_parser() -> argparse.ArgumentParser:
             "required positive cache cap when "
             "--metal-runtime-cache-mla-kv-b-f32 is enabled"
         ),
+    )
+    serve.add_argument(
+        "--metal-runtime-expert-pin-plan",
+        default=None,
+        help="quality-preserving hot-expert plan for the persistent Metal runtime",
+    )
+    serve.add_argument(
+        "--metal-runtime-max-adaptive-expert-cache-gib",
+        type=float,
+        default=0.0,
+        help="override the plan's evictable expert cache budget",
     )
     serve.add_argument(
         "--metal-runtime-mmap-final-logits",

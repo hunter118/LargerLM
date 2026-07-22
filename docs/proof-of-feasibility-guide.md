@@ -106,6 +106,12 @@ GiB of evictable expert cache. The evictable tier must shrink before the 24 GiB
 free-memory guard is crossed; 80 GiB is a conditional total expert working set,
 not an unconditional pinned allocation.
 
+The Metal runtime also requires the macOS VM-pressure level to be normal. It
+validates the whole hard-pinned allocation before preload, then checks pressure
+again for every adaptive allocation. Adaptive entries use per-layer LRU quotas
+to avoid decode-order cache thrashing; warning or critical pressure stops cache
+growth rather than risking system-wide swapping.
+
 Build the no-weight plan with:
 
 ```bash
@@ -115,6 +121,22 @@ python3 scripts/expert_usage_plan.py route-stats.jsonl \
   --write-profile expert-usage-profile.json \
   --write-plan expert-pin-plan.json
 ```
+
+The resulting plan is an executable runtime input:
+
+```bash
+metal/glm_moe_infer \
+  --prepared artifacts/glm-5.2-mxfp4/largerlm-prepared \
+  --expert-pin-plan expert-pin-plan.json \
+  --max-live-working-set-mib 98304 \
+  --min-free-unified-memory-gib 24 \
+  ...
+```
+
+The larger live cap includes expert residency; it does not mean the runtime
+will allocate 96 GiB immediately. The 44 GiB hard tier is planned, while the
+adaptive tier grows only on misses and remains bounded by both its 36 GiB cap
+and the live memory guards.
 
 ## Installation
 

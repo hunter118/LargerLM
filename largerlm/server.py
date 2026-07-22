@@ -5200,6 +5200,8 @@ class PreparedServerConfig:
     decode_mla_key_cache: bool = False
     metal_runtime_cache_mla_kv_b_f32: bool = False
     metal_runtime_max_mla_kv_b_cache_mib: float = 0.0
+    metal_runtime_expert_pin_plan: Path | None = None
+    metal_runtime_max_adaptive_expert_cache_gib: float = 0.0
     metal_runtime_mmap_final_logits: bool = False
     metal_runtime_context1_o_proj_cache_layout: Path | None = None
     metal_runtime_context1_o_proj_cache_file: Path | None = None
@@ -7013,6 +7015,10 @@ class PreparedGenerationApp:
             config,
             "metal_runtime_max_mla_kv_b_cache_mib",
         )
+        _require_nonnegative_config_value(
+            config,
+            "metal_runtime_max_adaptive_expert_cache_gib",
+        )
         if (
             config.metal_runtime_cache_mla_kv_b_f32
             and config.metal_runtime_max_mla_kv_b_cache_mib <= 0
@@ -7020,6 +7026,23 @@ class PreparedGenerationApp:
             raise PreparedServerError(
                 "metal_runtime_max_mla_kv_b_cache_mib must be positive when "
                 "metal_runtime_cache_mla_kv_b_f32 is enabled"
+            )
+        if config.metal_runtime_expert_pin_plan is not None:
+            try:
+                expert_pin_plan = Path(
+                    config.metal_runtime_expert_pin_plan
+                ).expanduser().resolve()
+            except TypeError as exc:
+                raise PreparedServerError(
+                    "metal_runtime_expert_pin_plan must be a path"
+                ) from exc
+            if not expert_pin_plan.is_file():
+                raise PreparedServerError(
+                    f"metal runtime expert pin plan does not exist: {expert_pin_plan}"
+                )
+            config = replace(
+                config,
+                metal_runtime_expert_pin_plan=expert_pin_plan,
             )
         if config.metal_runtime_context1_o_proj_cache_layout is not None:
             try:
@@ -7168,10 +7191,21 @@ class PreparedGenerationApp:
 
     def _metal_runtime_session(self) -> MetalGenerateServerSession:
         if self._metal_generate_session is None or self._metal_generate_session.closed:
+            runtime_session_kwargs: dict[str, object] = {
+                "binary": self.state.config.metal_binary_path,
+                "prepared_dir": self.state.prepared.manifest_path.parent,
+                "quiet": not self.state.config.echo_runner_output,
+            }
+            if self.state.config.metal_runtime_expert_pin_plan is not None:
+                runtime_session_kwargs["expert_pin_plan"] = (
+                    self.state.config.metal_runtime_expert_pin_plan
+                )
+            if self.state.config.metal_runtime_max_adaptive_expert_cache_gib > 0.0:
+                runtime_session_kwargs["max_adaptive_expert_cache_gib"] = (
+                    self.state.config.metal_runtime_max_adaptive_expert_cache_gib
+                )
             self._metal_generate_session = MetalGenerateServerSession(
-                binary=self.state.config.metal_binary_path,
-                prepared_dir=self.state.prepared.manifest_path.parent,
-                quiet=not self.state.config.echo_runner_output,
+                **runtime_session_kwargs,
             )
         return self._metal_generate_session
 
@@ -7489,6 +7523,14 @@ class PreparedGenerationApp:
             ),
             "metal_runtime_max_mla_kv_b_cache_mib": (
                 cfg.metal_runtime_max_mla_kv_b_cache_mib
+            ),
+            "metal_runtime_expert_pin_plan": (
+                str(cfg.metal_runtime_expert_pin_plan)
+                if cfg.metal_runtime_expert_pin_plan is not None
+                else None
+            ),
+            "metal_runtime_max_adaptive_expert_cache_gib": (
+                cfg.metal_runtime_max_adaptive_expert_cache_gib
             ),
             "metal_runtime_mmap_final_logits": (
                 cfg.metal_runtime_mmap_final_logits
@@ -8460,6 +8502,12 @@ class PreparedGenerationApp:
                             prompt_token_ids=prompt,
                             max_new_tokens=max_new_tokens,
                             binary=self.state.config.metal_binary_path,
+                            expert_pin_plan=(
+                                self.state.config.metal_runtime_expert_pin_plan
+                            ),
+                            max_adaptive_expert_cache_gib=(
+                                self.state.config.metal_runtime_max_adaptive_expert_cache_gib
+                            ),
                             top_k=kwargs["top_k"],
                             logits_top_k=int(kwargs["top_k"]),
                             max_live_working_set_mib=(
@@ -8624,6 +8672,12 @@ class PreparedGenerationApp:
                                 skip_special_tokens=skip_special_tokens,
                                 max_prompt_tokens=prompt_cap,
                                 binary=self.state.config.metal_binary_path,
+                                expert_pin_plan=(
+                                    self.state.config.metal_runtime_expert_pin_plan
+                                ),
+                                max_adaptive_expert_cache_gib=(
+                                    self.state.config.metal_runtime_max_adaptive_expert_cache_gib
+                                ),
                                 top_k=kwargs["top_k"],
                                 logits_top_k=int(kwargs["top_k"]),
                                 max_live_working_set_mib=(

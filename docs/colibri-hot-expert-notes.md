@@ -8,9 +8,10 @@ The performance project is active again for one narrow hypothesis: GLM expert
 usage may be skewed enough that a learned resident hot set removes much of the
 SSD traffic seen by the original LargerLM route.
 
-This is not yet a speed result. The profiler, runtime route telemetry, and
-residency planner work without full model weights, but the hot store and
-adaptive cache still need to be integrated and measured with GLM-5.2 weights.
+This is not yet a real-model speed result. The profiler, runtime route
+telemetry, residency planner, hard-pinned hot store, and adaptive per-layer LRU
+are integrated and pass synthetic Metal tests. They still need to be measured
+with GLM-5.2 weights.
 
 ## What Colibri Changes
 
@@ -47,8 +48,8 @@ The `m5-max-128g-safe` profile separates expert memory into two tiers:
 This permits an 80 GiB expert working set only while memory pressure is low.
 Pinning the full 80 GiB would be unsafe: adding dense weights, Metal/KV scratch,
 the OS, drivers, page tables, and the 24 GiB guard would exceed the machine's
-128 GB capacity. The runtime integration must evict LRU entries before crossing
-the guard and must refuse new allocations if pressure remains high.
+128 GB capacity. The runtime evicts adaptive entries before crossing the guard
+and refuses execution or new cache allocations if pressure remains high.
 
 ## Usage Profiler And Plan
 
@@ -88,6 +89,42 @@ The plan is quality preserving: it changes residency priority, not router
 selection. Selection is greedy by observed count per expert byte, so layers
 with different expert slot sizes use the RAM budget efficiently.
 
+The plan is consumed directly by `glm_moe_infer`:
+
+```bash
+make -C metal glm_moe_infer
+
+metal/glm_moe_infer \
+  --prepared artifacts/glm-5.2-mxfp4/largerlm-prepared \
+  --expert-pin-plan expert-pin-plan.json \
+  --generate-token-ids \
+  ...
+```
+
+At first execution the runtime validates the complete pin plan and available
+memory before allocating anything large. Planned experts are loaded into
+stable shared `MTLBuffer` objects. A route hit passes that buffer directly to
+the MXFP4 kernel; it does not copy the expert into a staging buffer. Misses use
+the existing bounded parallel `pread` path and are admitted to an evictable
+cache only when both the byte budget and memory guard permit it.
+
+Allocation requires both enough reclaimable pages to preserve the configured
+minimum and a normal macOS VM-pressure level. Warning or critical pressure
+refuses preload/cache growth. This is intentionally conservative for a 128 GB
+unified-memory machine where excessive pressure can make the whole desktop
+unresponsive.
+
+The adaptive budget is divided evenly across routed layers. Each layer has its
+own LRU so the normal layer-by-layer decode scan cannot evict early-layer
+experts merely because later layers ran more recently. Under actual system
+memory pressure the runtime may evict the globally oldest adaptive entry from
+any layer. Pinned entries are never selected for eviction.
+
+Runtime JSON includes `expert_resident_cache` plus per-layer and aggregate
+`expert_cache_hit_count`, `expert_cache_miss_count`, `expert_cache_hit_bytes`,
+and SSD read counters. These fields are the basis for the later real-model
+decision.
+
 ## M5 Neural Accelerators
 
 Apple documents a Neural Accelerator in each M5 GPU core. Metal Performance
@@ -110,10 +147,17 @@ Neural Accelerators principally help compute-heavy batched prefill. They do not
 remove SSD latency from batch-one decode, so hot-expert residency remains the
 central decode optimization.
 
-## Next Runtime Milestones
+## Validation And Next Milestones
 
-1. Materialize the planned 44 GiB hot set as a bounded resident slab.
-2. Add a 36 GiB maximum evictable per-layer LRU with memory-pressure shrinkage.
-3. Add layer-ahead prefetch without altering selected experts.
-4. Re-download or externally copy GLM-5.2 weights and measure hit rate, SSD
+The no-weight Metal smoke now verifies pinned hits, adaptive hits, per-layer LRU
+eviction, unchanged MXFP4 output, reduced SSD task count, and refusal when the
+minimum-free-memory guard cannot be met. The composed context-1 decode smoke
+also passes.
+
+Remaining work:
+
+1. Add bounded layer-ahead prefetch without altering selected experts.
+2. Repair/install the Xcode Metal Toolchain and compare direct MPP TensorOps
+   against the working MPSGraph prefill path.
+3. Re-download or externally copy GLM-5.2 weights and measure hit rate, SSD
    bytes/token, prefill time, decode tok/s, and peak memory.

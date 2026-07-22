@@ -155,6 +155,9 @@ def test_pin_plan_uses_byte_weighted_frequency_and_stays_in_budget(
     assert plan["covered_profile_selections"] == 19
     assert plan["profile_hit_fraction"] == 19 / 34
     assert plan["memory_envelope"]["requires_runtime_rss_guard"] is True
+    assert plan["planner_only"] is False
+    assert plan["runtime_consumable"] is True
+    assert plan["runtime_cli_flag"] == "--expert-pin-plan"
     assert plan["memory_envelope"]["maximum_expert_resident_gib"] == 80
 
 

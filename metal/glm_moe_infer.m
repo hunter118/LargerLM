@@ -36,6 +36,8 @@ typedef struct {
     const char *resident_layout;
     const char *expert_layout;
     int open_experts;
+    const char *expert_pin_plan;
+    double max_adaptive_expert_cache_gib;
     int mmap_resident;
     int wrap_resident_metal;
     int json;
@@ -140,6 +142,8 @@ typedef struct {
     double min_free_unified_memory_gib;
 } LoaderOptions;
 
+@class ExpertResidentCache;
+
 typedef struct {
     int fd;
     char *path;
@@ -148,7 +152,44 @@ typedef struct {
     uint64_t expert_slot_bytes;
     uint64_t num_experts;
     int layer;
+    __unsafe_unretained ExpertResidentCache *cache;
 } ExpertFile;
+
+@interface ExpertCacheEntry : NSObject
+@property(nonatomic, strong) NSString *key;
+@property(nonatomic, strong) id<MTLBuffer> buffer;
+@property(nonatomic, assign) uint64_t bytes;
+@property(nonatomic, assign) uint64_t logicalBytes;
+@property(nonatomic, assign) int layer;
+@property(nonatomic, assign) uint64_t lastUse;
+@property(nonatomic, assign) BOOL pinned;
+@end
+
+@interface ExpertResidentCache : NSObject
+@property(nonatomic, strong) id<MTLDevice> device;
+@property(nonatomic, strong) NSString *planPath;
+@property(nonatomic, strong) NSArray *pinRows;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, ExpertCacheEntry *> *entries;
+@property(nonatomic, strong) NSMutableSet<NSString *> *pinnedKeys;
+@property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *layerAdaptiveBudgets;
+@property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *layerAdaptiveBytes;
+@property(nonatomic, assign) uint64_t hardBudgetBytes;
+@property(nonatomic, assign) uint64_t plannedPinnedBytes;
+@property(nonatomic, assign) uint64_t plannedPinnedAllocationBytes;
+@property(nonatomic, assign) uint64_t pinnedBytes;
+@property(nonatomic, assign) uint64_t adaptiveBudgetBytes;
+@property(nonatomic, assign) uint64_t adaptiveBytes;
+@property(nonatomic, assign) uint64_t minimumFreeBytes;
+@property(nonatomic, assign) uint64_t clock;
+@property(nonatomic, assign) uint64_t hitCount;
+@property(nonatomic, assign) uint64_t missCount;
+@property(nonatomic, assign) uint64_t hitBytes;
+@property(nonatomic, assign) uint64_t storeCount;
+@property(nonatomic, assign) uint64_t evictionCount;
+@property(nonatomic, assign) uint64_t pressureRejectCount;
+@property(nonatomic, assign) uint64_t preloadCount;
+@property(nonatomic, assign) BOOL preloadComplete;
+@end
 
 @interface GlmMoeRuntimeContext : NSObject
 @property(nonatomic, strong) NSString *residentLayoutPath;
@@ -175,6 +216,7 @@ typedef struct {
 @property(nonatomic, assign) uint64_t maxExpertSlotBytes;
 @property(nonatomic, assign) uint64_t totalExpertBytes;
 @property(nonatomic, assign) uint64_t expertBufferBytes;
+@property(nonatomic, strong) ExpertResidentCache *expertCache;
 @end
 
 static int g_shared_resident_fd = -1;
@@ -184,6 +226,12 @@ static NSString *g_shared_decode_cache_path = nil;
 static NSMutableData *g_shared_decode_cache_memory = nil;
 static void clear_shared_resident_file_if_fd(int fd);
 static void clear_shared_decode_cache_file_if_fd(int fd);
+
+@implementation ExpertCacheEntry
+@end
+
+@implementation ExpertResidentCache
+@end
 
 @implementation GlmMoeRuntimeContext
 - (void)dealloc {
@@ -226,6 +274,8 @@ typedef struct {
 
 typedef struct {
     int ok;
+    int memory_pressure_known;
+    int memory_pressure_level;
     uint64_t available_bytes;
     uint64_t total_bytes;
     uint64_t page_size;
@@ -592,6 +642,8 @@ static void usage(const char *argv0) {
     printf("  --resident-layout PATH          resident/layout.json\n");
     printf("  --expert-layout PATH            experts/layout.json\n");
     printf("  --no-open-experts               validate metadata without opening layer files\n");
+    printf("  --expert-pin-plan PATH          quality-preserving hot-expert residency plan\n");
+    printf("  --max-adaptive-expert-cache-gib N override evictable expert cache budget\n");
     printf("  --mmap-resident                 mmap resident.bin read-only\n");
     printf("  --wrap-resident-metal           wrap mmap'd resident.bin as a Metal buffer\n");
     printf("  --expert-buffer-count N         reusable expert buffers to allocate (default: 8, max: 64)\n");
@@ -992,6 +1044,8 @@ static LoaderOptions parse_options(int argc, char **argv) {
         .resident_layout = NULL,
         .expert_layout = NULL,
         .open_experts = 1,
+        .expert_pin_plan = NULL,
+        .max_adaptive_expert_cache_gib = 0.0,
         .mmap_resident = 0,
         .wrap_resident_metal = 0,
         .json = 0,
@@ -1108,6 +1162,13 @@ static LoaderOptions parse_options(int argc, char **argv) {
             options.expert_layout = argv[++i];
         } else if (strcmp(arg, "--no-open-experts") == 0) {
             options.open_experts = 0;
+        } else if (strcmp(arg, "--expert-pin-plan") == 0 && i + 1 < argc) {
+            options.expert_pin_plan = argv[++i];
+        } else if (strcmp(arg, "--max-adaptive-expert-cache-gib") == 0 && i + 1 < argc) {
+            options.max_adaptive_expert_cache_gib = parse_nonnegative_double(
+                argv[++i],
+                "--max-adaptive-expert-cache-gib"
+            );
         } else if (strcmp(arg, "--mmap-resident") == 0) {
             options.mmap_resident = 1;
         } else if (strcmp(arg, "--wrap-resident-metal") == 0) {
@@ -1393,6 +1454,10 @@ static LoaderOptions parse_options(int argc, char **argv) {
         (options.resident_layout == NULL || options.expert_layout == NULL)) {
         fprintf(stderr, "ERROR: provide --prepared or both layout paths\n");
         usage(argv[0]);
+        exit(2);
+    }
+    if (options.expert_pin_plan != NULL && !options.open_experts) {
+        fprintf(stderr, "ERROR: --expert-pin-plan requires open expert files\n");
         exit(2);
     }
     if (options.build_context1_o_proj_cache_layer && options.resident_layout == NULL) {
@@ -1966,6 +2031,16 @@ static int read_system_memory_snapshot(SystemMemorySnapshot *snapshot) {
         return 0;
     }
     snapshot->available_bytes = availablePages * (uint64_t)pageSize;
+    int pressureLevel = 0;
+    size_t pressureSize = sizeof(pressureLevel);
+    if (sysctlbyname("kern.memorystatus_vm_pressure_level",
+                     &pressureLevel,
+                     &pressureSize,
+                     NULL,
+                     0) == 0 && pressureSize == sizeof(pressureLevel)) {
+        snapshot->memory_pressure_known = 1;
+        snapshot->memory_pressure_level = pressureLevel;
+    }
     snapshot->page_size = (uint64_t)pageSize;
     uint64_t totalBytes = 0;
     size_t totalSize = sizeof(totalBytes);
@@ -2324,6 +2399,162 @@ static int ensure_runtime_decode_cache_file(GlmMoeRuntimeContext *runtime,
     return 1;
 }
 
+static NSString *expert_cache_key(int layer, int expert) {
+    return [NSString stringWithFormat:@"%d:%d", layer, expert];
+}
+
+static ExpertFile *runtime_expert_file_for_layer(GlmMoeRuntimeContext *runtime,
+                                                 int layer) {
+    if (!runtime || !runtime.expertFiles) {
+        return NULL;
+    }
+    for (NSUInteger i = 0; i < [runtime.layers count]; i++) {
+        if (runtime.expertFiles[i].layer == layer) {
+            return &runtime.expertFiles[i];
+        }
+    }
+    return NULL;
+}
+
+static int configure_expert_resident_cache(GlmMoeRuntimeContext *runtime,
+                                           LoaderOptions options) {
+    if (!runtime || options.expert_pin_plan == NULL) {
+        return 1;
+    }
+    NSString *planPath = [NSString stringWithUTF8String:options.expert_pin_plan];
+    NSDictionary *plan = load_json_dictionary(planPath);
+    NSString *schema = plan[@"schema"];
+    if (![schema isKindOfClass:[NSString class]] ||
+        ![schema isEqualToString:@"largerlm.expert_pin_plan.v1"]) {
+        fprintf(stderr, "ERROR: expert pin plan schema mismatch\n");
+        return 0;
+    }
+    if (![plan[@"quality_preserving"] boolValue] ||
+        [plan[@"changes_routing"] boolValue]) {
+        fprintf(stderr, "ERROR: expert pin plan must preserve routing and quality\n");
+        return 0;
+    }
+    NSArray *selected = plan[@"selected_experts"];
+    if (![selected isKindOfClass:[NSArray class]]) {
+        fprintf(stderr, "ERROR: expert pin plan selected_experts must be an array\n");
+        return 0;
+    }
+    uint64_t hardBudgetBytes = unsigned_number(plan[@"max_pin_bytes"],
+                                               "expert pin max_pin_bytes");
+    uint64_t declaredSelectedBytes = unsigned_number(plan[@"selected_bytes"],
+                                                     "expert pin selected_bytes");
+    if (declaredSelectedBytes > hardBudgetBytes) {
+        fprintf(stderr, "ERROR: expert pin selected_bytes exceed max_pin_bytes\n");
+        return 0;
+    }
+    NSMutableArray *pinRows = [NSMutableArray arrayWithCapacity:[selected count]];
+    NSMutableSet *pinnedKeys = [NSMutableSet setWithCapacity:[selected count]];
+    uint64_t selectedBytes = 0;
+    uint64_t allocationBytes = 0;
+    for (id raw in selected) {
+        if (![raw isKindOfClass:[NSDictionary class]]) {
+            fprintf(stderr, "ERROR: expert pin entry must be an object\n");
+            return 0;
+        }
+        NSDictionary *row = (NSDictionary *)raw;
+        uint64_t layerValue = unsigned_number(row[@"layer"], "expert pin layer");
+        uint64_t expertValue = unsigned_number(row[@"expert"], "expert pin expert");
+        uint64_t slotBytes = unsigned_number(row[@"expert_slot_bytes"],
+                                             "expert pin expert_slot_bytes");
+        if (layerValue > INT_MAX || expertValue > INT_MAX || slotBytes == 0) {
+            fprintf(stderr, "ERROR: expert pin entry exceeds supported range\n");
+            return 0;
+        }
+        ExpertFile *file = runtime_expert_file_for_layer(runtime, (int)layerValue);
+        if (!file || file->fd < 0 || expertValue >= file->num_experts ||
+            slotBytes != file->expert_slot_bytes) {
+            fprintf(stderr,
+                    "ERROR: expert pin entry layer=%llu expert=%llu does not match layout\n",
+                    (unsigned long long)layerValue,
+                    (unsigned long long)expertValue);
+            return 0;
+        }
+        NSString *key = expert_cache_key((int)layerValue, (int)expertValue);
+        if ([pinnedKeys containsObject:key]) {
+            fprintf(stderr, "ERROR: duplicate expert pin entry %s\n", [key UTF8String]);
+            return 0;
+        }
+        uint64_t allocated = round_up_u64(slotBytes, 2ull * 1024ull * 1024ull);
+        if (selectedBytes > UINT64_MAX - slotBytes ||
+            allocationBytes > UINT64_MAX - allocated) {
+            fprintf(stderr, "ERROR: expert pin byte total overflows\n");
+            return 0;
+        }
+        selectedBytes += slotBytes;
+        allocationBytes += allocated;
+        [pinnedKeys addObject:key];
+        [pinRows addObject:@{
+            @"layer": @((int)layerValue),
+            @"expert": @((int)expertValue),
+            @"slot_bytes": @(slotBytes),
+            @"allocation_bytes": @(allocated),
+            @"key": key,
+        }];
+    }
+    if (selectedBytes != declaredSelectedBytes) {
+        fprintf(stderr,
+                "ERROR: expert pin selected byte sum %llu does not match declared %llu\n",
+                (unsigned long long)selectedBytes,
+                (unsigned long long)declaredSelectedBytes);
+        return 0;
+    }
+
+    NSDictionary *envelope = [plan[@"memory_envelope"] isKindOfClass:[NSDictionary class]]
+        ? plan[@"memory_envelope"]
+        : @{};
+    double adaptiveGiB = options.max_adaptive_expert_cache_gib;
+    if (adaptiveGiB == 0.0 &&
+        [envelope[@"adaptive_evictable_expert_cache_gib"] isKindOfClass:[NSNumber class]]) {
+        adaptiveGiB = [envelope[@"adaptive_evictable_expert_cache_gib"] doubleValue];
+    }
+    double minimumFreeGiB = options.min_free_unified_memory_gib;
+    if ([envelope[@"minimum_free_unified_memory_gib"] isKindOfClass:[NSNumber class]]) {
+        double planMinimum = [envelope[@"minimum_free_unified_memory_gib"] doubleValue];
+        if (planMinimum > minimumFreeGiB) {
+            minimumFreeGiB = planMinimum;
+        }
+    }
+    uint64_t adaptiveBytes = 0;
+    uint64_t minimumFreeBytes = 0;
+    if (!double_gib_to_u64_bytes(adaptiveGiB, &adaptiveBytes) ||
+        !double_gib_to_u64_bytes(minimumFreeGiB, &minimumFreeBytes)) {
+        fprintf(stderr, "ERROR: expert cache memory envelope is invalid\n");
+        return 0;
+    }
+
+    ExpertResidentCache *cache = [[ExpertResidentCache alloc] init];
+    cache.device = runtime.device;
+    cache.planPath = planPath;
+    cache.pinRows = pinRows;
+    cache.entries = [NSMutableDictionary dictionary];
+    cache.pinnedKeys = pinnedKeys;
+    cache.layerAdaptiveBudgets = [NSMutableDictionary dictionary];
+    cache.layerAdaptiveBytes = [NSMutableDictionary dictionary];
+    cache.hardBudgetBytes = hardBudgetBytes;
+    cache.plannedPinnedBytes = selectedBytes;
+    cache.plannedPinnedAllocationBytes = allocationBytes;
+    cache.adaptiveBudgetBytes = adaptiveBytes;
+    cache.minimumFreeBytes = minimumFreeBytes;
+    uint64_t layerAdaptiveBudget = [runtime.layers count] > 0
+        ? adaptiveBytes / (uint64_t)[runtime.layers count]
+        : 0;
+    for (NSUInteger i = 0; i < [runtime.layers count]; i++) {
+        NSNumber *layerKey = @(runtime.expertFiles[i].layer);
+        cache.layerAdaptiveBudgets[layerKey] = @(layerAdaptiveBudget);
+        cache.layerAdaptiveBytes[layerKey] = @(0);
+    }
+    runtime.expertCache = cache;
+    for (NSUInteger i = 0; i < [runtime.layers count]; i++) {
+        runtime.expertFiles[i].cache = cache;
+    }
+    return 1;
+}
+
 static GlmMoeRuntimeContext *create_glm_moe_runtime_context(LoaderOptions options,
                                                             int *status) {
     if (status) {
@@ -2453,6 +2684,9 @@ static GlmMoeRuntimeContext *create_glm_moe_runtime_context(LoaderOptions option
             ctx.maxExpertSlotBytes = slotBytes;
         }
         ctx.totalExpertBytes += actualBytes;
+    }
+    if (!configure_expert_resident_cache(ctx, options)) {
+        return nil;
     }
     if (status) {
         *status = 0;
@@ -2609,7 +2843,11 @@ typedef struct {
 
 typedef struct {
     uint64_t bytes_read;
+    uint64_t cache_hit_bytes;
     double read_seconds;
+    uint32_t cache_hit_count;
+    uint32_t cache_miss_count;
+    uint32_t cache_store_count;
     uint32_t dispatch_count;
     uint32_t task_count;
     uint32_t max_task_count;
@@ -2811,6 +3049,392 @@ static void direct_expert_read_stats_add_dispatch(
     if (dispatchStats.used_serial_fallback) {
         stats->serial_dispatch_count++;
     }
+}
+
+static ExpertCacheEntry *expert_cache_lookup(ExpertResidentCache *cache,
+                                             int layer,
+                                             int expert) {
+    if (!cache) {
+        return nil;
+    }
+    NSString *key = expert_cache_key(layer, expert);
+    ExpertCacheEntry *entry = cache.entries[key];
+    if (entry) {
+        entry.lastUse = ++cache.clock;
+        cache.hitCount++;
+        cache.hitBytes += entry.logicalBytes;
+    } else {
+        cache.missCount++;
+    }
+    return entry;
+}
+
+static int expert_cache_evict_oldest_adaptive(ExpertResidentCache *cache,
+                                              int layer,
+                                              int restrictToLayer) {
+    if (!cache) {
+        return 0;
+    }
+    ExpertCacheEntry *oldest = nil;
+    for (ExpertCacheEntry *entry in [cache.entries allValues]) {
+        if (!entry.pinned &&
+            (!restrictToLayer || entry.layer == layer) &&
+            (!oldest || entry.lastUse < oldest.lastUse)) {
+            oldest = entry;
+        }
+    }
+    if (!oldest) {
+        return 0;
+    }
+    if (oldest.bytes > cache.adaptiveBytes) {
+        cache.adaptiveBytes = 0;
+    } else {
+        cache.adaptiveBytes -= oldest.bytes;
+    }
+    NSNumber *layerKey = @(oldest.layer);
+    uint64_t layerBytes = [cache.layerAdaptiveBytes[layerKey] unsignedLongLongValue];
+    cache.layerAdaptiveBytes[layerKey] =
+        @(oldest.bytes > layerBytes ? 0 : layerBytes - oldest.bytes);
+    [cache.entries removeObjectForKey:oldest.key];
+    cache.evictionCount++;
+    return 1;
+}
+
+static int expert_cache_prepare_adaptive_allocation(ExpertResidentCache *cache,
+                                                    int layer,
+                                                    uint64_t allocationBytes) {
+    if (!cache || allocationBytes == 0 ||
+        allocationBytes > cache.adaptiveBudgetBytes) {
+        return 0;
+    }
+    NSNumber *layerKey = @(layer);
+    uint64_t layerBudget =
+        [cache.layerAdaptiveBudgets[layerKey] unsignedLongLongValue];
+    uint64_t layerBytes =
+        [cache.layerAdaptiveBytes[layerKey] unsignedLongLongValue];
+    if (allocationBytes > layerBudget) {
+        cache.pressureRejectCount++;
+        return 0;
+    }
+    while (layerBytes > layerBudget - allocationBytes) {
+        if (!expert_cache_evict_oldest_adaptive(cache, layer, 1)) {
+            cache.pressureRejectCount++;
+            return 0;
+        }
+        layerBytes = [cache.layerAdaptiveBytes[layerKey] unsignedLongLongValue];
+    }
+    while (cache.adaptiveBytes > cache.adaptiveBudgetBytes - allocationBytes) {
+        if (!expert_cache_evict_oldest_adaptive(cache, layer, 0)) {
+            cache.pressureRejectCount++;
+            return 0;
+        }
+    }
+    if (cache.minimumFreeBytes == 0) {
+        return 1;
+    }
+    for (;;) {
+        SystemMemorySnapshot snapshot = {0};
+        if (!read_system_memory_snapshot(&snapshot)) {
+            cache.pressureRejectCount++;
+            return 0;
+        }
+        if (snapshot.memory_pressure_known &&
+            snapshot.memory_pressure_level != 1) {
+            cache.pressureRejectCount++;
+            return 0;
+        }
+        if (snapshot.available_bytes >= cache.minimumFreeBytes &&
+            snapshot.available_bytes - cache.minimumFreeBytes >= allocationBytes) {
+            return 1;
+        }
+        if (!expert_cache_evict_oldest_adaptive(cache, layer, 0)) {
+            cache.pressureRejectCount++;
+            return 0;
+        }
+    }
+}
+
+static id<MTLBuffer> expert_cache_allocate_buffer(ExpertResidentCache *cache,
+                                                  int layer,
+                                                  uint64_t slotBytes,
+                                                  int pinned) {
+    if (!cache || slotBytes == 0) {
+        return nil;
+    }
+    uint64_t allocationBytes = round_up_u64(slotBytes, 2ull * 1024ull * 1024ull);
+    if (allocationBytes > (uint64_t)NSUIntegerMax) {
+        return nil;
+    }
+    if (!pinned &&
+        !expert_cache_prepare_adaptive_allocation(cache, layer, allocationBytes)) {
+        return nil;
+    }
+    void *ptr = NULL;
+    int rc = posix_memalign(&ptr, 2 * 1024 * 1024, (size_t)allocationBytes);
+    if (rc != 0 || !ptr) {
+        if (!pinned) {
+            cache.pressureRejectCount++;
+        }
+        return nil;
+    }
+    id<MTLBuffer> buffer =
+        [cache.device newBufferWithBytesNoCopy:ptr
+                                        length:(NSUInteger)allocationBytes
+                                       options:MTLResourceStorageModeShared
+                                   deallocator:^(void *pointer, NSUInteger length) {
+                                       (void)length;
+                                       free(pointer);
+                                   }];
+    if (!buffer) {
+        free(ptr);
+        if (!pinned) {
+            cache.pressureRejectCount++;
+        }
+        return nil;
+    }
+    return buffer;
+}
+
+static void expert_cache_insert(ExpertResidentCache *cache,
+                                int layer,
+                                int expert,
+                                id<MTLBuffer> buffer,
+                                uint64_t slotBytes,
+                                int pinned) {
+    if (!cache || !buffer) {
+        return;
+    }
+    NSString *key = expert_cache_key(layer, expert);
+    if (cache.entries[key]) {
+        return;
+    }
+    ExpertCacheEntry *entry = [[ExpertCacheEntry alloc] init];
+    entry.key = key;
+    entry.buffer = buffer;
+    entry.bytes = [buffer length];
+    entry.logicalBytes = slotBytes;
+    entry.layer = layer;
+    entry.lastUse = ++cache.clock;
+    entry.pinned = pinned ? YES : NO;
+    cache.entries[key] = entry;
+    if (pinned) {
+        cache.pinnedBytes += entry.bytes;
+    } else {
+        cache.adaptiveBytes += entry.bytes;
+        NSNumber *layerKey = @(layer);
+        uint64_t layerBytes =
+            [cache.layerAdaptiveBytes[layerKey] unsignedLongLongValue];
+        cache.layerAdaptiveBytes[layerKey] = @(layerBytes + entry.bytes);
+    }
+    cache.storeCount++;
+}
+
+static int preload_expert_resident_cache(GlmMoeRuntimeContext *runtime) {
+    ExpertResidentCache *cache = runtime ? runtime.expertCache : nil;
+    if (!cache || cache.preloadComplete) {
+        return 1;
+    }
+    if (cache.minimumFreeBytes > 0 && cache.plannedPinnedAllocationBytes > 0) {
+        SystemMemorySnapshot snapshot = {0};
+        if (!read_system_memory_snapshot(&snapshot) ||
+            (snapshot.memory_pressure_known &&
+             snapshot.memory_pressure_level != 1) ||
+            snapshot.available_bytes < cache.minimumFreeBytes ||
+            snapshot.available_bytes - cache.minimumFreeBytes <
+                cache.plannedPinnedAllocationBytes) {
+            fprintf(stderr,
+                    "ERROR: refusing expert preload: available memory cannot hold %llu bytes while preserving %llu bytes free\n",
+                    (unsigned long long)cache.plannedPinnedAllocationBytes,
+                    (unsigned long long)cache.minimumFreeBytes);
+            return 0;
+        }
+    }
+    for (NSDictionary *row in cache.pinRows) {
+        int layer = [row[@"layer"] intValue];
+        int expert = [row[@"expert"] intValue];
+        uint64_t slotBytes = [row[@"slot_bytes"] unsignedLongLongValue];
+        ExpertFile *file = runtime_expert_file_for_layer(runtime, layer);
+        if (!file || file->fd < 0) {
+            fprintf(stderr, "ERROR: pinned expert layer %d is not open\n", layer);
+            return 0;
+        }
+        if (cache.entries[expert_cache_key(layer, expert)]) {
+            continue;
+        }
+        id<MTLBuffer> buffer =
+            expert_cache_allocate_buffer(cache, layer, slotBytes, 1);
+        if (!buffer) {
+            fprintf(stderr,
+                    "ERROR: failed to allocate pinned expert layer=%d expert=%d\n",
+                    layer,
+                    expert);
+            return 0;
+        }
+        double started = now_seconds();
+        if (!pread_exact_or_report(file->fd,
+                                   [buffer contents],
+                                   slotBytes,
+                                   (uint64_t)expert * slotBytes,
+                                   file->path)) {
+            return 0;
+        }
+        (void)started;
+        [buffer didModifyRange:NSMakeRange(0, (NSUInteger)slotBytes)];
+        expert_cache_insert(cache, layer, expert, buffer, slotBytes, 1);
+        cache.preloadCount++;
+    }
+    cache.preloadComplete = YES;
+    return 1;
+}
+
+static NSDictionary *expert_resident_cache_payload(ExpertResidentCache *cache) {
+    if (!cache) {
+        return @{
+            @"enabled": @(NO),
+        };
+    }
+    return @{
+        @"enabled": @(YES),
+        @"quality_preserving": @(YES),
+        @"changes_routing": @(NO),
+        @"plan_path": cache.planPath ?: (id)[NSNull null],
+        @"preload_complete": @(cache.preloadComplete),
+        @"preload_count": @(cache.preloadCount),
+        @"entry_count": @([cache.entries count]),
+        @"pinned_entry_count": @([cache.pinnedKeys count]),
+        @"hard_budget_bytes": @(cache.hardBudgetBytes),
+        @"planned_pinned_bytes": @(cache.plannedPinnedBytes),
+        @"planned_pinned_allocation_bytes": @(cache.plannedPinnedAllocationBytes),
+        @"pinned_allocation_bytes": @(cache.pinnedBytes),
+        @"adaptive_budget_bytes": @(cache.adaptiveBudgetBytes),
+        @"adaptive_allocation_bytes": @(cache.adaptiveBytes),
+        @"adaptive_layer_count": @([cache.layerAdaptiveBudgets count]),
+        @"adaptive_bytes_per_layer": @([cache.layerAdaptiveBudgets count] > 0
+            ? cache.adaptiveBudgetBytes / (uint64_t)[cache.layerAdaptiveBudgets count]
+            : 0),
+        @"minimum_free_bytes": @(cache.minimumFreeBytes),
+        @"hit_count": @(cache.hitCount),
+        @"miss_count": @(cache.missCount),
+        @"hit_bytes": @(cache.hitBytes),
+        @"store_count": @(cache.storeCount),
+        @"eviction_count": @(cache.evictionCount),
+        @"pressure_reject_count": @(cache.pressureRejectCount),
+    };
+}
+
+static int resolve_direct_expert_slots(ExpertFile *expertFile,
+                                       IntList experts,
+                                       int expertOffset,
+                                       int count,
+                                       NSArray *scratchBuffers,
+                                       NSMutableArray *resolvedBuffers,
+                                       DirectExpertReadStats *stats) {
+    if (count <= 0) {
+        return 1;
+    }
+    if (!expertFile || expertFile->fd < 0 || expertFile->expert_slot_bytes == 0 ||
+        !scratchBuffers || !resolvedBuffers || expertOffset < 0 ||
+        expertOffset + count > experts.count ||
+        count > MAX_EXPERT_BUFFERS || count > (int)[scratchBuffers count]) {
+        fprintf(stderr, "ERROR: invalid cached expert resolve request\n");
+        return 0;
+    }
+    while ((int)[resolvedBuffers count] < count) {
+        [resolvedBuffers addObject:[NSNull null]];
+    }
+
+    ParallelPreadTask tasks[MAX_EXPERT_BUFFERS];
+    int taskSlots[MAX_EXPERT_BUFFERS];
+    int taskExperts[MAX_EXPERT_BUFFERS];
+    int taskCacheable[MAX_EXPERT_BUFFERS];
+    int taskPinned[MAX_EXPERT_BUFFERS];
+    id<MTLBuffer> taskBuffers[MAX_EXPERT_BUFFERS];
+    int taskCount = 0;
+    ExpertResidentCache *cache = expertFile->cache;
+    for (int i = 0; i < count; i++) {
+        int expert = experts.values[expertOffset + i];
+        if (expert < 0 || (uint64_t)expert >= expertFile->num_experts) {
+            fprintf(stderr,
+                    "ERROR: expert id %d is outside layer %d range 0..%llu\n",
+                    expert,
+                    expertFile->layer,
+                    (unsigned long long)(expertFile->num_experts - 1));
+            return 0;
+        }
+        ExpertCacheEntry *entry = expert_cache_lookup(cache, expertFile->layer, expert);
+        if (entry) {
+            resolvedBuffers[(NSUInteger)i] = entry.buffer;
+            if (stats) {
+                stats->cache_hit_count++;
+                stats->cache_hit_bytes += expertFile->expert_slot_bytes;
+            }
+            continue;
+        }
+        if (stats) {
+            stats->cache_miss_count++;
+        }
+        NSString *key = expert_cache_key(expertFile->layer, expert);
+        int pinned = cache && [cache.pinnedKeys containsObject:key];
+        id<MTLBuffer> buffer = cache
+            ? expert_cache_allocate_buffer(cache,
+                                           expertFile->layer,
+                                           expertFile->expert_slot_bytes,
+                                           pinned)
+            : nil;
+        int cacheable = buffer != nil;
+        if (!buffer) {
+            buffer = scratchBuffers[(NSUInteger)i];
+        }
+        if ((uint64_t)[buffer length] < expertFile->expert_slot_bytes ||
+            ![buffer contents]) {
+            fprintf(stderr, "ERROR: resolved expert Metal buffer is too small\n");
+            return 0;
+        }
+        resolvedBuffers[(NSUInteger)i] = buffer;
+        taskSlots[taskCount] = i;
+        taskExperts[taskCount] = expert;
+        taskCacheable[taskCount] = cacheable;
+        taskPinned[taskCount] = pinned;
+        taskBuffers[taskCount] = buffer;
+        tasks[taskCount] = (ParallelPreadTask){
+            .fd = expertFile->fd,
+            .dst = [buffer contents],
+            .bytes = expertFile->expert_slot_bytes,
+            .offset = (uint64_t)expert * expertFile->expert_slot_bytes,
+            .path = expertFile->path,
+            .ok = 0,
+        };
+        taskCount++;
+    }
+    if (taskCount == 0) {
+        return 1;
+    }
+    double readStarted = now_seconds();
+    ParallelPreadDispatchStats dispatchStats = {0};
+    int readOk = parallel_pread_exact_or_report(tasks, taskCount, &dispatchStats);
+    double readSeconds = now_seconds() - readStarted;
+    if (!readOk) {
+        return 0;
+    }
+    uint64_t bytesRead = 0;
+    for (int i = 0; i < taskCount; i++) {
+        (void)taskSlots[i];
+        [taskBuffers[i] didModifyRange:NSMakeRange(0, (NSUInteger)tasks[i].bytes)];
+        bytesRead += tasks[i].bytes;
+        if (taskCacheable[i]) {
+            expert_cache_insert(cache,
+                                expertFile->layer,
+                                taskExperts[i],
+                                taskBuffers[i],
+                                expertFile->expert_slot_bytes,
+                                taskPinned[i]);
+            if (stats) {
+                stats->cache_store_count++;
+            }
+        }
+    }
+    direct_expert_read_stats_add_dispatch(stats, dispatchStats, bytesRead, readSeconds);
+    return 1;
 }
 
 static int read_direct_expert_slots(ExpertFile *expertFile,
@@ -12463,6 +13087,7 @@ static int encode_glm_mxfp4_down_weighted_add(id<MTLCommandBuffer> cmd,
 typedef struct {
     int ok;
     uint64_t expert_bytes_read;
+    uint64_t expert_cache_hit_bytes;
     uint64_t shared_bytes_read;
     double elapsed_seconds;
     double expert_read_seconds;
@@ -12472,6 +13097,9 @@ typedef struct {
     uint32_t expert_read_max_worker_count;
     uint32_t expert_read_pool_dispatch_count;
     uint32_t expert_read_serial_dispatch_count;
+    uint32_t expert_cache_hit_count;
+    uint32_t expert_cache_miss_count;
+    uint32_t expert_cache_store_count;
     double kernel_seconds;
     double shared_read_seconds;
     double shared_prefetch_seconds;
@@ -12563,6 +13191,7 @@ typedef struct {
     uint64_t scratch_bytes;
     uint64_t hot_intermediate_memory_bytes;
     uint64_t expert_bytes_read;
+    uint64_t expert_cache_hit_bytes;
     uint64_t dense_mlp_bytes_read;
     uint64_t shared_bytes_read;
     uint32_t expert_read_dispatch_count;
@@ -12571,6 +13200,9 @@ typedef struct {
     uint32_t expert_read_max_worker_count;
     uint32_t expert_read_pool_dispatch_count;
     uint32_t expert_read_serial_dispatch_count;
+    uint32_t expert_cache_hit_count;
+    uint32_t expert_cache_miss_count;
+    uint32_t expert_cache_store_count;
     double expert_read_seconds;
     double moe_mlp_kernel_seconds;
     double moe_mlp_output_write_seconds;
@@ -12666,6 +13298,7 @@ typedef struct {
     int input_buffer_direct_count;
     uint64_t hot_intermediate_memory_bytes;
     uint64_t expert_bytes_read;
+    uint64_t expert_cache_hit_bytes;
     uint64_t dense_mlp_bytes_read;
     uint64_t shared_bytes_read;
     double layer_elapsed_seconds;
@@ -12705,6 +13338,9 @@ typedef struct {
     uint32_t expert_read_max_worker_count;
     uint32_t expert_read_pool_dispatch_count;
     uint32_t expert_read_serial_dispatch_count;
+    uint32_t expert_cache_hit_count;
+    uint32_t expert_cache_miss_count;
+    uint32_t expert_cache_store_count;
     uint32_t attn_projection_command_buffer_count;
     uint32_t attn_projection_synchronous_wait_count;
     uint32_t attn_projection_async_submitted_count;
@@ -12763,6 +13399,7 @@ static DecodeLayersAggregateStats collect_decode_layers_aggregate_stats(
         }
         stats.hot_intermediate_memory_bytes += summary->hot_intermediate_memory_bytes;
         stats.expert_bytes_read += summary->expert_bytes_read;
+        stats.expert_cache_hit_bytes += summary->expert_cache_hit_bytes;
         stats.dense_mlp_bytes_read += summary->dense_mlp_bytes_read;
         stats.shared_bytes_read += summary->shared_bytes_read;
         stats.layer_elapsed_seconds += summary->elapsed_seconds;
@@ -12877,6 +13514,9 @@ static DecodeLayersAggregateStats collect_decode_layers_aggregate_stats(
             summary->expert_read_pool_dispatch_count;
         stats.expert_read_serial_dispatch_count +=
             summary->expert_read_serial_dispatch_count;
+        stats.expert_cache_hit_count += summary->expert_cache_hit_count;
+        stats.expert_cache_miss_count += summary->expert_cache_miss_count;
+        stats.expert_cache_store_count += summary->expert_cache_store_count;
     }
     stats.command_buffer_count =
         stats.attn_projection_command_buffer_count +
@@ -12936,6 +13576,10 @@ static void add_decode_layers_aggregate_payload_fields(
     payload[@"dense_mlp_elapsed_seconds"] = @(stats.dense_mlp_elapsed_seconds);
     payload[@"moe_mlp_elapsed_seconds"] = @(stats.moe_mlp_elapsed_seconds);
     payload[@"expert_read_seconds"] = @(stats.expert_read_seconds);
+    payload[@"expert_cache_hit_bytes"] = @(stats.expert_cache_hit_bytes);
+    payload[@"expert_cache_hit_count"] = @(stats.expert_cache_hit_count);
+    payload[@"expert_cache_miss_count"] = @(stats.expert_cache_miss_count);
+    payload[@"expert_cache_store_count"] = @(stats.expert_cache_store_count);
     payload[@"shared_bytes_read"] = @(stats.shared_bytes_read);
     payload[@"shared_read_seconds"] = @(stats.shared_read_seconds);
     payload[@"shared_prefetch_seconds"] = @(stats.shared_prefetch_seconds);
@@ -13279,6 +13923,11 @@ static int run_layer_moe_probe(id<MTLDevice> device,
                     MAX_EXPERT_BUFFERS);
             return 0;
         }
+        NSMutableArray *routeBuffers =
+            [NSMutableArray arrayWithCapacity:(NSUInteger)batchCount];
+        for (int slot = 0; slot < batchCount; slot++) {
+            [routeBuffers addObject:[NSNull null]];
+        }
         int routedReadCount = 0;
         if (routeIndex < experts.count) {
             routedReadCount = experts.count - routeIndex;
@@ -13288,15 +13937,20 @@ static int run_layer_moe_probe(id<MTLDevice> device,
         }
         if (routedReadCount > 0) {
             DirectExpertReadStats readStats = {0};
-            if (!read_direct_expert_slots(probeFile,
-                                          experts,
-                                          routeIndex,
-                                          routedReadCount,
-                                          expertBuffers,
-                                          &readStats)) {
+            if (!resolve_direct_expert_slots(probeFile,
+                                             experts,
+                                             routeIndex,
+                                             routedReadCount,
+                                             expertBuffers,
+                                             routeBuffers,
+                                             &readStats)) {
                 return 0;
             }
             stats->expert_bytes_read += readStats.bytes_read;
+            stats->expert_cache_hit_bytes += readStats.cache_hit_bytes;
+            stats->expert_cache_hit_count += readStats.cache_hit_count;
+            stats->expert_cache_miss_count += readStats.cache_miss_count;
+            stats->expert_cache_store_count += readStats.cache_store_count;
             stats->expert_read_seconds += readStats.read_seconds;
             stats->expert_read_dispatch_count += readStats.dispatch_count;
             stats->expert_read_task_count += readStats.task_count;
@@ -13313,6 +13967,7 @@ static int run_layer_moe_probe(id<MTLDevice> device,
             int currentRoute = routeIndex + slot;
             if (currentRoute >= experts.count) {
                 id<MTLBuffer> routeBuffer = [expertBuffers objectAtIndex:(NSUInteger)slot];
+                routeBuffers[(NSUInteger)slot] = routeBuffer;
                 if (prefetchedSharedExpert &&
                     routeIndex == 0 &&
                     (NSUInteger)slot == prefetchedSharedExpertSlot) {
@@ -13334,7 +13989,11 @@ static int run_layer_moe_probe(id<MTLDevice> device,
         }
         for (int slot = 0; slot < batchCount; slot++) {
             int currentRoute = routeIndex + slot;
-            id<MTLBuffer> routeBuffer = [expertBuffers objectAtIndex:(NSUInteger)slot];
+            id<MTLBuffer> routeBuffer = routeBuffers[(NSUInteger)slot];
+            if (![routeBuffer conformsToProtocol:@protocol(MTLBuffer)]) {
+                fprintf(stderr, "ERROR: unresolved expert route buffer\n");
+                return 0;
+            }
             Mxfp4ExpertInfo routeInfo =
                 currentRoute < experts.count ? info : sharedInfo->local;
             float routeWeight =
@@ -14862,6 +15521,8 @@ static int run_decode_layers_probe(id<MTLDevice> device,
                 summary->router_command_buffer_count =
                     moeStats.router.command_buffer_count;
                 summary->expert_bytes_read = moeStats.mlp.expert_bytes_read;
+                summary->expert_cache_hit_bytes =
+                    moeStats.mlp.expert_cache_hit_bytes;
                 summary->shared_bytes_read = moeStats.mlp.shared_bytes_read;
                 summary->shared_read_seconds = moeStats.mlp.shared_read_seconds;
                 summary->shared_prefetch_seconds =
@@ -14880,6 +15541,12 @@ static int run_decode_layers_probe(id<MTLDevice> device,
                     moeStats.mlp.expert_read_pool_dispatch_count;
                 summary->expert_read_serial_dispatch_count =
                     moeStats.mlp.expert_read_serial_dispatch_count;
+                summary->expert_cache_hit_count =
+                    moeStats.mlp.expert_cache_hit_count;
+                summary->expert_cache_miss_count =
+                    moeStats.mlp.expert_cache_miss_count;
+                summary->expert_cache_store_count =
+                    moeStats.mlp.expert_cache_store_count;
                 summary->expert_read_seconds = moeStats.mlp.expert_read_seconds;
                 summary->moe_mlp_kernel_seconds = moeStats.mlp.kernel_seconds;
                 summary->moe_mlp_output_write_seconds =
@@ -15993,6 +16660,8 @@ static int run_generate_server_jsonl(LoaderOptions baseOptions) {
             @"expert_layer_count": @([runtime.layers count]),
             @"expert_files_opened": @(runtime.openedExpertFiles),
             @"expert_buffer_count_runtime_allocated": @([runtime.expertBuffers count]),
+            @"expert_resident_cache":
+                expert_resident_cache_payload(runtime.expertCache),
         })) {
         return 1;
     }
@@ -16185,6 +16854,8 @@ static int run_generate_server_jsonl(LoaderOptions baseOptions) {
                     @(mla_kv_b_memory_cache_current_bytes()),
                 @"runtime_context_ready": @(YES),
                 @"runtime_reused": @(dryRun ? NO : YES),
+                @"expert_resident_cache":
+                    expert_resident_cache_payload(runtime.expertCache),
                 @"include_shared_expert": @(requestOptions.include_shared_expert ? YES : NO),
                 @"max_live_working_set_mib": @(requestOptions.max_live_working_set_mib),
                 @"min_free_unified_memory_gib": @(requestOptions.min_free_unified_memory_gib),
@@ -17136,6 +17807,10 @@ static int run_glm_moe_infer_with_runtime(LoaderOptions options,
             : runtimeExpertBufferCountBefore;
         uint64_t reusableExpertBytes = expertBufferBytes * (uint64_t)liveExpertBufferCount;
         uint64_t estimatedLiveBytes = reusableExpertBytes;
+        if (runtime.expertCache) {
+            estimatedLiveBytes += runtime.expertCache.plannedPinnedAllocationBytes;
+            estimatedLiveBytes += runtime.expertCache.adaptiveBytes;
+        }
         if (options.mmap_resident || options.wrap_resident_metal) {
             estimatedLiveBytes += residentFileBytes;
         }
@@ -17183,8 +17858,16 @@ static int run_glm_moe_infer_with_runtime(LoaderOptions options,
         SystemMemorySnapshot memorySnapshot = {0};
         int freeUnifiedMemoryOk = 1;
         int systemMemorySnapshotOk = 0;
-        if (options.min_free_unified_memory_gib > 0.0) {
-            if (!double_gib_to_u64_bytes(options.min_free_unified_memory_gib,
+        double effectiveMinimumFreeGiB = options.min_free_unified_memory_gib;
+        if (runtime.expertCache && runtime.expertCache.minimumFreeBytes > 0) {
+            double cacheMinimumFreeGiB =
+                runtime.expertCache.minimumFreeBytes / 1073741824.0;
+            if (cacheMinimumFreeGiB > effectiveMinimumFreeGiB) {
+                effectiveMinimumFreeGiB = cacheMinimumFreeGiB;
+            }
+        }
+        if (effectiveMinimumFreeGiB > 0.0) {
+            if (!double_gib_to_u64_bytes(effectiveMinimumFreeGiB,
                                          &minFreeUnifiedMemoryBytes)) {
                 freeUnifiedMemoryOk = 0;
                 fprintf(stderr,
@@ -17195,7 +17878,13 @@ static int run_glm_moe_infer_with_runtime(LoaderOptions options,
                         "ERROR: could not inspect system available memory for --min-free-unified-memory-gib\n");
             } else {
                 systemMemorySnapshotOk = 1;
-                if (estimatedLiveBytes > UINT64_MAX - minFreeUnifiedMemoryBytes) {
+                if (memorySnapshot.memory_pressure_known &&
+                    memorySnapshot.memory_pressure_level != 1) {
+                    freeUnifiedMemoryOk = 0;
+                    fprintf(stderr,
+                            "ERROR: VM memory pressure level %d is not normal; refusing allocation\n",
+                            memorySnapshot.memory_pressure_level);
+                } else if (estimatedLiveBytes > UINT64_MAX - minFreeUnifiedMemoryBytes) {
                     freeUnifiedMemoryOk = 0;
                     requiredAvailableMemoryBytes = UINT64_MAX;
                     fprintf(stderr,
@@ -17214,6 +17903,10 @@ static int run_glm_moe_infer_with_runtime(LoaderOptions options,
             }
         }
         int admissionOk = liveOk && freeUnifiedMemoryOk;
+        if (admissionOk && !preload_expert_resident_cache(runtime)) {
+            admissionOk = 0;
+            freeUnifiedMemoryOk = 0;
+        }
 
         NSString *runtimeDecodeCachePath = options.cache_file
             ? [NSString stringWithUTF8String:options.cache_file]
@@ -18395,6 +19088,8 @@ static int run_glm_moe_infer_with_runtime(LoaderOptions options,
             payload[@"expert_buffer_count_requested"] = @(options.expert_buffer_count);
             payload[@"expert_buffer_bytes_each"] = @(expertBufferBytes);
             payload[@"expert_buffer_bytes_total"] = @(reusableExpertBytes);
+            payload[@"expert_resident_cache"] =
+                expert_resident_cache_payload(runtime.expertCache);
             payload[@"probe_layer_moe_scratch_bytes"] = @(probeMoeScratchBytes);
             payload[@"probe_shared_expert_storage_bytes"] = @(sharedExpertStorageBytes);
             payload[@"probe_router_scratch_bytes"] = @(routerScratchBytes);
@@ -18443,7 +19138,7 @@ static int run_glm_moe_infer_with_runtime(LoaderOptions options,
             payload[@"estimated_live_working_set_bytes"] = @(estimatedLiveBytes);
             payload[@"max_live_working_set_mib"] = @(options.max_live_working_set_mib);
             payload[@"live_working_set_ok"] = @(liveOk);
-            payload[@"min_free_unified_memory_gib"] = @(options.min_free_unified_memory_gib);
+            payload[@"min_free_unified_memory_gib"] = @(effectiveMinimumFreeGiB);
             payload[@"min_free_unified_memory_bytes"] = @(minFreeUnifiedMemoryBytes);
             payload[@"required_available_memory_bytes"] = @(requiredAvailableMemoryBytes);
             payload[@"available_unified_memory_ok"] = @(freeUnifiedMemoryOk);
@@ -18451,6 +19146,13 @@ static int run_glm_moe_infer_with_runtime(LoaderOptions options,
             payload[@"system_memory_source"] = systemMemorySnapshotOk
                 ? @"host_statistics64"
                 : (id)[NSNull null];
+            payload[@"system_memory_pressure_known"] = systemMemorySnapshotOk
+                ? @(memorySnapshot.memory_pressure_known ? YES : NO)
+                : (id)[NSNull null];
+            payload[@"system_memory_pressure_level"] =
+                (systemMemorySnapshotOk && memorySnapshot.memory_pressure_known)
+                    ? @(memorySnapshot.memory_pressure_level)
+                    : (id)[NSNull null];
             payload[@"system_page_size"] = systemMemorySnapshotOk
                 ? @(memorySnapshot.page_size)
                 : (id)[NSNull null];
@@ -18866,6 +19568,12 @@ static int run_glm_moe_infer_with_runtime(LoaderOptions options,
                     @(decoderLayerStats.mlp.elapsed_seconds);
                 decoderPayload[@"mlp_expert_read_seconds"] =
                     @(decoderLayerStats.mlp.expert_read_seconds);
+                decoderPayload[@"mlp_expert_cache_hit_bytes"] =
+                    @(decoderLayerStats.mlp.expert_cache_hit_bytes);
+                decoderPayload[@"mlp_expert_cache_hit_count"] =
+                    @(decoderLayerStats.mlp.expert_cache_hit_count);
+                decoderPayload[@"mlp_expert_cache_miss_count"] =
+                    @(decoderLayerStats.mlp.expert_cache_miss_count);
                 decoderPayload[@"mlp_kernel_seconds"] =
                     @(decoderLayerStats.mlp.kernel_seconds);
                 decoderPayload[@"mlp_output_write_seconds"] =
@@ -19144,6 +19852,14 @@ static int run_glm_moe_infer_with_runtime(LoaderOptions options,
                         @(summary->router_command_buffer_count);
                     item[@"mlp_elapsed_seconds"] = @(summary->mlp_elapsed_seconds);
                     item[@"expert_bytes_read"] = @(summary->expert_bytes_read);
+                    item[@"expert_cache_hit_bytes"] =
+                        @(summary->expert_cache_hit_bytes);
+                    item[@"expert_cache_hit_count"] =
+                        @(summary->expert_cache_hit_count);
+                    item[@"expert_cache_miss_count"] =
+                        @(summary->expert_cache_miss_count);
+                    item[@"expert_cache_store_count"] =
+                        @(summary->expert_cache_store_count);
                     item[@"shared_bytes_read"] = @(summary->shared_bytes_read);
                     item[@"shared_read_seconds"] = @(summary->shared_read_seconds);
                     item[@"shared_prefetch_seconds"] =
@@ -19448,6 +20164,14 @@ static int run_glm_moe_infer_with_runtime(LoaderOptions options,
                 moePayload[@"group_size"] = @(probeMoeInfo.group_size);
                 moePayload[@"scratch_bytes"] = @(probeMoeScratchBytes);
                 moePayload[@"expert_bytes_read"] = @(layerMoeStats.expert_bytes_read);
+                moePayload[@"expert_cache_hit_bytes"] =
+                    @(layerMoeStats.expert_cache_hit_bytes);
+                moePayload[@"expert_cache_hit_count"] =
+                    @(layerMoeStats.expert_cache_hit_count);
+                moePayload[@"expert_cache_miss_count"] =
+                    @(layerMoeStats.expert_cache_miss_count);
+                moePayload[@"expert_cache_store_count"] =
+                    @(layerMoeStats.expert_cache_store_count);
                 moePayload[@"shared_bytes_read"] = @(layerMoeStats.shared_bytes_read);
                 moePayload[@"elapsed_seconds"] = @(layerMoeStats.elapsed_seconds);
                 moePayload[@"expert_read_seconds"] = @(layerMoeStats.expert_read_seconds);

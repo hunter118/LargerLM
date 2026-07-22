@@ -198,6 +198,8 @@ class MetalTextGenerationSession:
         *,
         prepared_dir: str | Path,
         binary: str | Path = "metal/glm_moe_infer",
+        expert_pin_plan: str | Path | None = None,
+        max_adaptive_expert_cache_gib: float = 0.0,
         tokenizer_path: str | Path | None = None,
         tokenizer_backend: str = "auto",
         trust_remote_code: bool = False,
@@ -205,6 +207,10 @@ class MetalTextGenerationSession:
     ) -> None:
         self.prepared_dir = Path(prepared_dir)
         self.binary = Path(binary)
+        self.expert_pin_plan = expert_pin_plan
+        self.max_adaptive_expert_cache_gib = float(
+            max_adaptive_expert_cache_gib
+        )
         resolved_tokenizer = (
             Path(tokenizer_path)
             if tokenizer_path is not None
@@ -215,10 +221,19 @@ class MetalTextGenerationSession:
             backend=tokenizer_backend,
             trust_remote_code=trust_remote_code,
         )
+        runtime_session_kwargs: dict[str, object] = {
+            "binary": self.binary,
+            "prepared_dir": self.prepared_dir,
+            "quiet": quiet,
+        }
+        if self.expert_pin_plan is not None:
+            runtime_session_kwargs["expert_pin_plan"] = self.expert_pin_plan
+        if self.max_adaptive_expert_cache_gib > 0.0:
+            runtime_session_kwargs["max_adaptive_expert_cache_gib"] = (
+                self.max_adaptive_expert_cache_gib
+            )
         self.generate_server_session = MetalGenerateServerSession(
-            binary=self.binary,
-            prepared_dir=self.prepared_dir,
-            quiet=quiet,
+            **runtime_session_kwargs,
         )
 
     @property
@@ -241,6 +256,11 @@ class MetalTextGenerationSession:
             )
         generation_kwargs = dict(metal_generation_kwargs)
         generation_kwargs.setdefault("binary", self.binary)
+        generation_kwargs.setdefault("expert_pin_plan", self.expert_pin_plan)
+        generation_kwargs.setdefault(
+            "max_adaptive_expert_cache_gib",
+            self.max_adaptive_expert_cache_gib,
+        )
         generation_kwargs["generate_server_session"] = self.generate_server_session
         return _generate_metal_text_with_tokenizer(
             prepared_dir=self.prepared_dir,
@@ -296,6 +316,10 @@ def generate_metal_text_batch(
     with MetalTextGenerationSession(
         prepared_dir=prepared_dir,
         binary=binary,
+        expert_pin_plan=metal_generation_kwargs.get("expert_pin_plan"),
+        max_adaptive_expert_cache_gib=float(
+            metal_generation_kwargs.get("max_adaptive_expert_cache_gib", 0.0)
+        ),
         tokenizer_path=tokenizer_path,
         tokenizer_backend=tokenizer_backend,
         trust_remote_code=trust_remote_code,

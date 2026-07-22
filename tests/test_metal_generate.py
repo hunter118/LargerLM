@@ -23,6 +23,36 @@ class _FakeLayout:
         }
 
 
+def test_append_expert_cache_launch_args() -> None:
+    cmd = ["metal/glm_moe_infer"]
+
+    metal_generate._append_expert_cache_launch_args(
+        cmd,
+        expert_pin_plan="/tmp/expert-pin-plan.json",
+        max_adaptive_expert_cache_gib=36.0,
+    )
+
+    assert cmd == [
+        "metal/glm_moe_infer",
+        "--expert-pin-plan",
+        "/tmp/expert-pin-plan.json",
+        "--max-adaptive-expert-cache-gib",
+        "36",
+    ]
+
+
+def test_append_expert_cache_launch_args_keeps_default_command_unchanged() -> None:
+    cmd = ["metal/glm_moe_infer"]
+
+    metal_generate._append_expert_cache_launch_args(
+        cmd,
+        expert_pin_plan=None,
+        max_adaptive_expert_cache_gib=0.0,
+    )
+
+    assert cmd == ["metal/glm_moe_infer"]
+
+
 def test_generate_metal_token_ids_keeps_auto_work_dir(
     tmp_path: Path,
     monkeypatch,

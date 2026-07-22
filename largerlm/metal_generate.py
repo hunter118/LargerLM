@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 import tempfile
 import time
@@ -656,12 +657,31 @@ def _write_generate_request_json(
     return path
 
 
+def _append_expert_cache_launch_args(
+    cmd: list[str],
+    *,
+    expert_pin_plan: str | Path | None,
+    max_adaptive_expert_cache_gib: float,
+) -> None:
+    if expert_pin_plan is not None:
+        cmd.extend(["--expert-pin-plan", str(expert_pin_plan)])
+    if max_adaptive_expert_cache_gib > 0.0:
+        cmd.extend(
+            [
+                "--max-adaptive-expert-cache-gib",
+                f"{max_adaptive_expert_cache_gib:.9g}",
+            ]
+        )
+
+
 def _run_generate_server_jsonl_request(
     *,
     binary: str | Path,
     prepared_dir: str | Path,
     request: dict[str, object],
     quiet: bool,
+    expert_pin_plan: str | Path | None = None,
+    max_adaptive_expert_cache_gib: float = 0.0,
 ) -> tuple[dict[str, Any], float]:
     stdin = (
         json.dumps(request, separators=(",", ":"))
@@ -675,6 +695,11 @@ def _run_generate_server_jsonl_request(
         str(prepared_dir),
         "--generate-server-jsonl",
     ]
+    _append_expert_cache_launch_args(
+        cmd,
+        expert_pin_plan=expert_pin_plan,
+        max_adaptive_expert_cache_gib=max_adaptive_expert_cache_gib,
+    )
     started = time.monotonic()
     completed = subprocess.run(cmd, input=stdin, text=True, capture_output=True)
     elapsed = time.monotonic() - started
@@ -734,10 +759,26 @@ class MetalGenerateServerSession:
         *,
         binary: str | Path,
         prepared_dir: str | Path,
+        expert_pin_plan: str | Path | None = None,
+        max_adaptive_expert_cache_gib: float = 0.0,
         quiet: bool = True,
     ) -> None:
         self.binary = Path(binary)
         self.prepared_dir = Path(prepared_dir)
+        self.expert_pin_plan = (
+            Path(expert_pin_plan).expanduser().resolve()
+            if expert_pin_plan is not None
+            else None
+        )
+        self.max_adaptive_expert_cache_gib = float(max_adaptive_expert_cache_gib)
+        if self.expert_pin_plan is not None and not self.expert_pin_plan.is_file():
+            raise MetalGenerateError(
+                f"expert pin plan does not exist: {self.expert_pin_plan}"
+            )
+        if self.max_adaptive_expert_cache_gib < 0.0:
+            raise MetalGenerateError(
+                "max_adaptive_expert_cache_gib must be non-negative"
+            )
         self.quiet = quiet
         self.request_count = 0
         self.closed = False
@@ -747,6 +788,11 @@ class MetalGenerateServerSession:
             str(self.prepared_dir),
             "--generate-server-jsonl",
         ]
+        _append_expert_cache_launch_args(
+            cmd,
+            expert_pin_plan=self.expert_pin_plan,
+            max_adaptive_expert_cache_gib=max_adaptive_expert_cache_gib,
+        )
         self._process = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -862,6 +908,8 @@ def generate_metal_token_ids(
     prompt_token_ids: Sequence[int],
     max_new_tokens: int,
     binary: str | Path = "metal/glm_moe_infer",
+    expert_pin_plan: str | Path | None = None,
+    max_adaptive_expert_cache_gib: float = 0.0,
     work_dir: str | Path | None = None,
     keep_work_dir: bool = False,
     top_k: int | None = None,
@@ -910,6 +958,19 @@ def generate_metal_token_ids(
         )
     if max_new_tokens <= 0:
         raise MetalGenerateError("max_new_tokens must be positive")
+    if max_adaptive_expert_cache_gib < 0.0:
+        raise MetalGenerateError(
+            "max_adaptive_expert_cache_gib must be non-negative"
+        )
+    resolved_expert_pin_plan = (
+        Path(expert_pin_plan).expanduser().resolve()
+        if expert_pin_plan is not None
+        else None
+    )
+    if resolved_expert_pin_plan is not None and not resolved_expert_pin_plan.is_file():
+        raise MetalGenerateError(
+            f"expert pin plan does not exist: {resolved_expert_pin_plan}"
+        )
     if generate_server_session is not None and not use_generate_server_jsonl:
         raise MetalGenerateError(
             "generate_server_session requires use_generate_server_jsonl=True"
@@ -978,18 +1039,46 @@ def generate_metal_token_ids(
         raise MetalGenerateError(
             "generate_server_session prepared_dir does not match request prepared_dir"
         )
+    if generate_server_session is not None:
+        if (
+            getattr(generate_server_session, "expert_pin_plan", None)
+            != resolved_expert_pin_plan
+        ):
+            raise MetalGenerateError(
+                "generate_server_session expert_pin_plan does not match request"
+            )
+        if not math.isclose(
+            float(
+                getattr(
+                    generate_server_session,
+                    "max_adaptive_expert_cache_gib",
+                    0.0,
+                )
+            ),
+            float(max_adaptive_expert_cache_gib),
+        ):
+            raise MetalGenerateError(
+                "generate_server_session adaptive expert cache budget does not match request"
+            )
 
     def run_generate_server_request(
         request: dict[str, object],
     ) -> tuple[dict[str, Any], float]:
         if generate_server_session is not None:
             return generate_server_session.request(request)
-        return _run_generate_server_jsonl_request(
-            binary=binary,
-            prepared_dir=manifest.manifest_path.parent,
-            request=request,
-            quiet=quiet,
-        )
+        server_kwargs: dict[str, object] = {
+            "binary": binary,
+            "prepared_dir": manifest.manifest_path.parent,
+            "request": request,
+            "quiet": quiet,
+        }
+        if resolved_expert_pin_plan is not None:
+            server_kwargs["expert_pin_plan"] = resolved_expert_pin_plan
+        if max_adaptive_expert_cache_gib > 0.0:
+            server_kwargs["max_adaptive_expert_cache_gib"] = (
+                max_adaptive_expert_cache_gib
+            )
+        return _run_generate_server_jsonl_request(**server_kwargs)
 
     temp_root: tempfile.TemporaryDirectory[str] | None = None
     if work_dir is None:
@@ -1100,6 +1189,11 @@ def generate_metal_token_ids(
                     str(request_path),
                     "--json",
                 ]
+                _append_expert_cache_launch_args(
+                    cmd,
+                    expert_pin_plan=resolved_expert_pin_plan,
+                    max_adaptive_expert_cache_gib=max_adaptive_expert_cache_gib,
+                )
                 started = time.monotonic()
                 completed = _run_command(cmd, quiet=quiet)
                 elapsed = time.monotonic() - started
@@ -1365,6 +1459,13 @@ def generate_metal_token_ids(
                         str(request_path),
                         "--json",
                     ]
+                    _append_expert_cache_launch_args(
+                        cmd,
+                        expert_pin_plan=resolved_expert_pin_plan,
+                        max_adaptive_expert_cache_gib=(
+                            max_adaptive_expert_cache_gib
+                        ),
+                    )
                     started = time.monotonic()
                     completed = _run_command(cmd, quiet=quiet)
                     metal_elapsed = time.monotonic() - started
@@ -1547,6 +1648,11 @@ def generate_metal_token_ids(
                 f"{resolved_min_free_unified_memory_gib:.9g}",
                 "--json",
             ]
+            _append_expert_cache_launch_args(
+                cmd,
+                expert_pin_plan=resolved_expert_pin_plan,
+                max_adaptive_expert_cache_gib=max_adaptive_expert_cache_gib,
+            )
             started = time.monotonic()
             completed = _run_command(cmd, quiet=quiet)
             first_elapsed = time.monotonic() - started
@@ -1699,6 +1805,11 @@ def generate_metal_token_ids(
                 str(request_path),
                 "--json",
             ]
+            _append_expert_cache_launch_args(
+                cmd,
+                expert_pin_plan=resolved_expert_pin_plan,
+                max_adaptive_expert_cache_gib=max_adaptive_expert_cache_gib,
+            )
             started = time.monotonic()
             completed = _run_command(cmd, quiet=quiet)
             elapsed = time.monotonic() - started

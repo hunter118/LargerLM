@@ -1736,8 +1736,21 @@ It intentionally
 avoids a large application-owned weight cache; richer continuous batching,
 streaming, tool calling, and prefix sharing remain a later scheduling layer.
 
-This stage should prefer OS page cache over a large application-owned cache.
-Small scratch buffers and telemetry are fine; multi-GB pinned caches are not.
+The default serving profile still prefers the OS page cache over a large
+application-owned cache. The explicit M5 Max 128 GB profile is the exception:
+it may consume a measured `largerlm.expert_pin_plan.v1` with 44 GiB of hard
+residency and at most 36 GiB of adaptive residency. That path requires a normal
+macOS VM-pressure level and preserves at least 24 GiB of available unified
+memory; it refuses preload when the complete hard set does not fit.
+
+Pinned experts live in stable shared `MTLBuffer` objects and are passed directly
+to the MXFP4 kernels on route hits. Adaptive misses use the existing bounded
+parallel `pread` path, then enter a per-layer LRU only if the layer quota and
+memory guard allow it. Per-layer segmentation matters because decode scans
+layers in order: a global LRU alone would repeatedly evict early-layer entries
+after later layers complete. Under actual memory pressure, cross-layer eviction
+is allowed for adaptive entries; hard-pinned entries are never eviction
+candidates. Routing and weights are unchanged.
 
 ## Packed Expert Format
 

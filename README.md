@@ -36,9 +36,9 @@ LargerLM demonstrates that a GLM-style MoE checkpoint can be split into:
 - admission checks that cap live memory, free unified memory, disk usage, and
   routed read volume.
 
-The project also provides a quality-preserving expert-usage profiler and pin
-planner. It can learn a hot set from LargerLM telemetry, router JSON/JSONL, or
-Colibri `.coli_usage` files without opening model weights.
+The project also provides a quality-preserving expert-usage profiler, pin
+planner, and bounded runtime expert cache. It can learn a hot set from
+LargerLM telemetry, router JSON/JSONL, or Colibri `.coli_usage` files.
 
 ## Device Requirements
 
@@ -100,6 +100,10 @@ python3 scripts/expert_usage_plan.py route-stats.jsonl \
   --write-plan expert-pin-plan.json
 ```
 
+Pass the result to the Metal runtime with
+`--expert-pin-plan expert-pin-plan.json`. It preloads the hard-pinned set and
+uses a memory-guarded per-layer LRU for the adaptive tier.
+
 ## Viability Gate
 
 When local prepared artifacts exist, the sealed GLM-5.2 route can be checked
@@ -128,7 +132,8 @@ changed and the stop decision should be revisited.
 
 ## Current Status
 
-Active feasibility work has resumed. Complete runtime route telemetry, expert
-profiling, and bounded residency planning are implemented; runtime hot-store/LRU
-integration and real-weight speed validation remain. The previous `<1.5 tok/s`
-evidence is still the baseline, and no `5 tok/s` claim is made.
+Active feasibility work has resumed. Runtime route telemetry, expert profiling,
+hard-pinned residency, adaptive per-layer LRU caching, and memory-pressure
+refusal are implemented and pass synthetic Metal tests. Real-weight speed
+validation remains. The previous `<1.5 tok/s` evidence is still the baseline,
+and no `5 tok/s` claim is made.
