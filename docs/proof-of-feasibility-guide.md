@@ -3,9 +3,10 @@
 LargerLM is a proof-of-feasibility project for running GLM-style MoE models on
 Apple Silicon when the full model is larger than unified memory. It is not a
 production inference engine and it is not a high-throughput serving stack. The
-current local GLM-5.2 MXFP4 route is sealed as a minimum runnable version:
+original local GLM-5.2 MXFP4 route was sealed as a minimum runnable version:
 bounded generation works, but the measured and projected speed is below the
-`5 tok/s` continuation target.
+`5 tok/s` continuation target. Performance exploration resumed on 2026-07-22
+for learned hot-expert residency and M5 prefill acceleration.
 
 The useful result is the engineering map: how to split a large MoE checkpoint
 into resident tensors and SSD-backed routed experts, how to keep memory bounded,
@@ -38,9 +39,10 @@ The current GLM-5.2 MXFP4 evidence says:
   `56 GiB/s` of useful routed-expert reads before attention, kernels, logits, or
   scheduling overhead.
 
-This is why the project is sealed as a minimum runnable proof of feasibility.
-See `docs/minimal-usable-seal.md` for the exact stop decision and restart
-criteria.
+These numbers remain the baseline for the original all-streaming route. The
+reopened work must beat them by reducing actual SSD misses, not by projecting
+faster storage. See `docs/colibri-hot-expert-notes.md` for the active direction
+and `docs/minimal-usable-seal.md` for the historical stop decision.
 
 ## Principle
 
@@ -98,6 +100,21 @@ For the local 128 GiB M5 Max experiments, the safe serving shape used a 16 GiB
 Metal live cap and a 24 GiB free unified-memory admission guard. Those values
 are conservative; keep them conservative unless you are deliberately measuring a
 new envelope.
+
+The reopened residency plan uses 44 GiB of hard-pinned hot experts and up to 36
+GiB of evictable expert cache. The evictable tier must shrink before the 24 GiB
+free-memory guard is crossed; 80 GiB is a conditional total expert working set,
+not an unconditional pinned allocation.
+
+Build the no-weight plan with:
+
+```bash
+python3 scripts/expert_usage_plan.py route-stats.jsonl \
+  --expert-layout experts/layout.json \
+  --m5-max-128g-safe \
+  --write-profile expert-usage-profile.json \
+  --write-plan expert-pin-plan.json
+```
 
 ## Installation
 

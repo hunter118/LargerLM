@@ -2,6 +2,11 @@
 
 Date: 2026-07-05
 
+Historical note: the original route was reopened on 2026-07-22 to investigate
+Colibri-style learned hot-expert residency, a bounded adaptive LRU, and M5
+Neural Accelerator prefill. The measurements below remain the baseline for the
+old all-streaming route; they are not a stop order for the reopened experiment.
+
 ## Decision
 
 Seal the current GLM-5.2 MXFP4 Apple Silicon route as a minimum runnable version
@@ -68,7 +73,7 @@ python3 -m largerlm serve-prepared artifacts/glm-5.2-mxfp4/largerlm-prepared \
   --min-free-unified-memory-gib 24
 ```
 
-## Do Not Continue
+## Historical Stop Scope
 
 Do not spend more time on these under the current GLM-5.2 MXFP4 layout:
 

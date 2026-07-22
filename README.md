@@ -5,18 +5,21 @@ GLM-style MoE models that are larger than unified memory. It explores
 SSD-backed routed expert streaming, bounded Metal execution, and safety gates
 for 4-bit GLM-5.2-style checkpoints.
 
-This repository is not a production inference engine. The current GLM-5.2 MXFP4
-route is sealed as a minimum runnable proof of feasibility: guarded generation
-works, but measured decode is around `0.9-1.0 tok/s` and the best
-evidence-backed projection is `1.485 tok/s`, below the `5 tok/s` continuation
-target.
+This repository is not a production inference engine. The original GLM-5.2
+MXFP4 route reached guarded generation at around `0.9-1.0 tok/s`, with a best
+evidence-backed projection of `1.485 tok/s`. Performance work has been reopened
+to test Colibri-style learned hot-expert residency, bounded adaptive caching,
+and M5 GPU Neural Accelerator prefill paths. No local model weights are
+currently included.
 
 ## Start Here
 
 - [Proof-of-feasibility guide](docs/proof-of-feasibility-guide.md): device
   requirements, design principle, safety model, and usage commands.
-- [Minimum runnable seal](docs/minimal-usable-seal.md): why the GLM-5.2 route
-  was stopped at a minimum usable version.
+- [Colibri hot-expert notes](docs/colibri-hot-expert-notes.md): the reopened
+  performance direction and the 128 GB M5 Max memory envelope.
+- [Minimum runnable seal](docs/minimal-usable-seal.md): the historical stop
+  decision for the original streaming route.
 - [Architecture notes](docs/architecture.md): deeper implementation details.
 - [Flash-MOE rewrite decision](docs/flash-moe-rewrite-decision.md): comparison
   with Flash-MOE-style streaming and the final efficiency call.
@@ -33,19 +36,18 @@ LargerLM demonstrates that a GLM-style MoE checkpoint can be split into:
 - admission checks that cap live memory, free unified memory, disk usage, and
   routed read volume.
 
-The project also shows the limit of this approach for the tested GLM-5.2 MXFP4
-layout: routed expert traffic is about `11.206 GiB/token`, so reaching `5 tok/s`
-would require roughly `56 GiB/s` of useful expert traffic before attention,
-logits, kernels, or scheduling overhead.
+The project also provides a quality-preserving expert-usage profiler and pin
+planner. It can learn a hot set from LargerLM telemetry, router JSON/JSONL, or
+Colibri `.coli_usage` files without opening model weights.
 
 ## Device Requirements
 
 Recommended for reproducing the local experiments:
 
-- Apple Silicon Mac, ideally Max/Ultra class.
-- 128 GiB unified memory for the GLM-5.2 experiments.
+- Apple M5 Max with 128 GB unified memory for the current target profile.
 - Fast internal SSD with hundreds of GB free.
-- macOS with Xcode command line tools and Metal support.
+- macOS 26 with Metal 4; the full Xcode Metal Toolchain is needed for direct MPP
+  TensorOps development.
 - Python 3.9+.
 
 Model weights and prepared artifacts are not included. Local artifacts are
@@ -84,6 +86,20 @@ Use guarded commands only. Important knobs include:
 The local proof-of-feasibility route used conservative guards such as a 16 GiB
 Metal live cap and a 24 GiB free unified-memory admission guard.
 
+The reopened M5 Max plan uses up to 44 GiB of hard-pinned hot experts plus an
+evictable cache of up to 36 GiB. The 80 GiB total is conditional: the evictable
+tier must shrink before the 24 GiB free-memory guard is crossed.
+
+Build a no-weight expert profile and pin plan with:
+
+```bash
+python3 scripts/expert_usage_plan.py route-stats.jsonl \
+  --expert-layout experts/layout.json \
+  --m5-max-128g-safe \
+  --write-profile expert-usage-profile.json \
+  --write-plan expert-pin-plan.json
+```
+
 ## Viability Gate
 
 When local prepared artifacts exist, the sealed GLM-5.2 route can be checked
@@ -112,7 +128,7 @@ changed and the stop decision should be revisited.
 
 ## Current Status
 
-The project is archived as a minimum runnable proof of feasibility. Continue
-only if the model layout changes substantially, a comparable Mac demonstrates
-real GLM-family `>=5 tok/s` decode safely, or the goal changes from throughput
-to a polished low-throughput local demo.
+Active feasibility work has resumed. Complete runtime route telemetry, expert
+profiling, and bounded residency planning are implemented; runtime hot-store/LRU
+integration and real-weight speed validation remain. The previous `<1.5 tok/s`
+evidence is still the baseline, and no `5 tok/s` claim is made.

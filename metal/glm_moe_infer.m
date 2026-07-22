@@ -12618,6 +12618,8 @@ typedef struct {
     uint32_t post_attn_norm_command_buffer_count;
     uint32_t router_command_buffer_count;
     uint32_t post_attn_norm_router_command_buffer_count;
+    uint32_t router_top_k;
+    int router_experts[64];
     int dense_mlp_fused_pipeline;
     uint32_t dense_mlp_command_buffer_count;
     uint32_t dense_mlp_synchronous_wait_count;
@@ -12630,6 +12632,32 @@ typedef struct {
     uint32_t synchronous_wait_count;
     float output0;
 } DecodeLayerRunSummary;
+
+static NSArray *expert_routes_payload(DecodeLayerPlan *plans,
+                                      DecodeLayerRunSummary *summaries,
+                                      int count) {
+    NSMutableArray *routes = [NSMutableArray array];
+    if (!plans || !summaries || count <= 0) {
+        return routes;
+    }
+    for (int i = 0; i < count; i++) {
+        DecodeLayerPlan *plan = &plans[i];
+        DecodeLayerRunSummary *summary = &summaries[i];
+        if (plan->is_dense || summary->router_top_k == 0) {
+            continue;
+        }
+        NSMutableArray *experts =
+            [NSMutableArray arrayWithCapacity:summary->router_top_k];
+        for (uint32_t route = 0; route < summary->router_top_k; route++) {
+            [experts addObject:@(summary->router_experts[route])];
+        }
+        [routes addObject:@{
+            @"layer": @(plan->layer),
+            @"experts": experts,
+        }];
+    }
+    return routes;
+}
 
 typedef struct {
     int dense_count;
@@ -14865,6 +14893,10 @@ static int run_decode_layers_probe(id<MTLDevice> device,
                     summary->moe_mlp_overhead_seconds = 0.0;
                 }
                 summary->router_gpu_topk = moeStats.router.gpu_topk;
+                summary->router_top_k = moeStats.router.top_k;
+                for (uint32_t route = 0; route < moeStats.router.top_k; route++) {
+                    summary->router_experts[route] = moeStats.router.experts[route];
+                }
                 summary->moe_mlp_residual_add_fused =
                     moeStats.mlp.residual_add_fused;
                 summary->moe_mlp_input_buffer_direct =
@@ -17940,6 +17972,11 @@ static int run_glm_moe_infer_with_runtime(LoaderOptions options,
                                 @(promptDecodeAggregate.expert_bytes_read);
                             prefillPayload[@"dense_mlp_bytes_read"] =
                                 @(promptDecodeAggregate.dense_mlp_bytes_read);
+                            prefillPayload[@"expert_routes"] = expert_routes_payload(
+                                decodeLayerPlans,
+                                decodeLayerSummaries,
+                                (int)decodeLayers.count
+                            );
                             add_decode_layers_aggregate_payload_fields(
                                 prefillPayload,
                                 promptDecodeAggregate
@@ -18135,6 +18172,13 @@ static int run_glm_moe_infer_with_runtime(LoaderOptions options,
                             @(stepDecodeAggregate.expert_bytes_read);
                         stepPayload[@"dense_mlp_bytes_read"] =
                             @(stepDecodeAggregate.dense_mlp_bytes_read);
+                        stepPayload[@"expert_routes"] = stepRunsDecode
+                            ? expert_routes_payload(
+                                decodeLayerPlans,
+                                decodeLayerSummaries,
+                                (int)decodeLayers.count
+                            )
+                            : @[];
                         add_decode_layers_aggregate_payload_fields(
                             stepPayload,
                             stepDecodeAggregate
@@ -19129,6 +19173,14 @@ static int run_glm_moe_infer_with_runtime(LoaderOptions options,
                     item[@"router_topk_backend"] = summary->is_dense
                         ? @"none"
                         : (summary->router_gpu_topk ? @"metal" : @"cpu");
+                    NSMutableArray *selectedExperts =
+                        [NSMutableArray arrayWithCapacity:summary->router_top_k];
+                    for (uint32_t route = 0;
+                         route < summary->router_top_k;
+                         route++) {
+                        [selectedExperts addObject:@(summary->router_experts[route])];
+                    }
+                    item[@"selected_experts"] = selectedExperts;
                     item[@"moe_mlp_residual_add_fused"] =
                         @(summary->moe_mlp_residual_add_fused ? YES : NO);
                     item[@"moe_mlp_input_buffer_direct"] =

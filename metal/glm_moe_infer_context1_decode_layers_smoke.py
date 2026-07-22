@@ -144,6 +144,8 @@ def main() -> int:
         ]
     )
     context = run_json(context_cmd)
+    if first_layer(baseline).get("selected_experts") != [0]:
+        raise SystemExit(f"decode-layers did not expose the routed expert: {baseline}")
     if bool(first_layer(baseline).get("attn_output_context1_o_proj_cache")):
         raise SystemExit("baseline decode-layers unexpectedly used context1 cache")
     if not bool(first_layer(context).get("attn_output_context1_o_proj_cache")):
