@@ -52,7 +52,10 @@ PREFILL_LINEAR_BACKENDS = {
     "mpsgraph-f32",
     "mps-matrix-f32",
     "auto",
+    "auto-mpp",
 }
+PREFILL_LINEAR_AUTO_MPP_BACKEND = "auto-mpp"
+PREFILL_LINEAR_AUTO_BACKENDS = {"auto", PREFILL_LINEAR_AUTO_MPP_BACKEND}
 PREFILL_LINEAR_ACCELERATED_BACKENDS = (
     "mpp-f32",
     "mpsgraph-f32",
@@ -175,13 +178,17 @@ def _resolve_prefill_linear_backend(
         raise PrefillExecuteError("prefill_mpsgraph_min_batch_tokens must be positive")
     if type(mpsgraph_min_matrix_dim) is not int or mpsgraph_min_matrix_dim <= 0:
         raise PrefillExecuteError("prefill_mpsgraph_min_matrix_dim must be positive")
-    if requested == "auto":
+    if requested in PREFILL_LINEAR_AUTO_BACKENDS:
         if (
             dtype in PREFILL_LINEAR_MPSGRAPH_DTYPES
             and batch_tokens >= mpsgraph_min_batch_tokens
             and min(in_dim, out_dim) >= mpsgraph_min_matrix_dim
         ):
-            return "mpsgraph-f32"
+            return (
+                "mpp-f32"
+                if requested == PREFILL_LINEAR_AUTO_MPP_BACKEND
+                else "mpsgraph-f32"
+            )
         return "custom-metal"
     if (
         requested in PREFILL_LINEAR_F32_CONVERSION_BACKENDS
@@ -4818,7 +4825,8 @@ def run_prefill_attention_projection_batch(
             or _batch_fused_attention_projections_enabled()
         )
         and Path(runner_path).name == "largerlm-runner"
-        and prefill_linear_backend in {"custom-metal", "auto"}
+        and prefill_linear_backend
+        in {"custom-metal", "auto", PREFILL_LINEAR_AUTO_MPP_BACKEND}
         and norm_suffix == ".input_layernorm.weight"
         and q_a_suffix == ".self_attn.q_a_proj.weight"
         and q_a_norm_suffix == ".self_attn.q_a_layernorm.weight"
@@ -6074,7 +6082,8 @@ def run_prefill_attention_output_batch(
         batch_tokens == 1
         and Path(runner_path).name == "largerlm-runner"
         and o_proj_suffix == ".self_attn.o_proj.weight"
-        and prefill_linear_backend in {"custom-metal", "auto"}
+        and prefill_linear_backend
+        in {"custom-metal", "auto", PREFILL_LINEAR_AUTO_MPP_BACKEND}
     ):
         runner = Path(runner_path)
         if not runner.exists():
@@ -6200,7 +6209,8 @@ def run_prefill_attention_output_batch(
         batch_tokens > 1
         and Path(runner_path).name == "largerlm-runner"
         and o_proj_suffix == ".self_attn.o_proj.weight"
-        and prefill_linear_backend in {"custom-metal", "auto"}
+        and prefill_linear_backend
+        in {"custom-metal", "auto", PREFILL_LINEAR_AUTO_MPP_BACKEND}
         and _batch_fused_attention_output_enabled()
     ):
         runner = Path(runner_path)
@@ -7570,8 +7580,8 @@ def _run_router_json_batch(
     )
     if (
         hybrid_threshold is not None
-        and prefill_linear_backend == "auto"
-        and resolved_router_backend == "mpsgraph-f32"
+        and prefill_linear_backend in PREFILL_LINEAR_AUTO_BACKENDS
+        and resolved_router_backend in {"mpp-f32", "mpsgraph-f32"}
     ):
         custom_logits_path = output_dir / "router_logits.custom.f32"
         custom_gate = run_resident_batch_linear(
@@ -8206,7 +8216,8 @@ def run_prefill_staged_routed_mlp_block_batch(
         used_fused_shared_expert = False
         if (
             _fused_shared_expert_batch_enabled()
-            and prefill_linear_backend in {"custom-metal", "auto"}
+            and prefill_linear_backend
+            in {"custom-metal", "auto", PREFILL_LINEAR_AUTO_MPP_BACKEND}
             and _shared_expert_fused_candidate_available(
                 resident_layout_path,
                 layer=layer,

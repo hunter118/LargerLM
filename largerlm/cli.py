@@ -12466,7 +12466,24 @@ def _launch_audit_from_health(
         else ()
     )
     validated_accel_set = {str(item) for item in validated_accel}
-    if prefill_required and "mpsgraph-f32" in selectable_accel:
+    acceleration_suggestion = (
+        capability.get("suggested_prefill_acceleration_flags")
+        if isinstance(capability, dict)
+        else None
+    )
+    runtime_probe_backend = (
+        acceleration_suggestion.get("runtime_probe_backend")
+        if isinstance(acceleration_suggestion, dict)
+        else None
+    )
+    if prefill_required and runtime_probe_backend == "mpp-f32":
+        probe_ok = (
+            "mpp-f32" in validated_accel_set
+            and capability.get("mpp_run_probe_requested") is True
+            and capability.get("mpp_run_probe_ran") is True
+            and capability.get("mpp_run_probe_ok") is True
+        )
+    elif prefill_required and runtime_probe_backend == "mpsgraph-f32":
         probe_ok = (
             "mpsgraph-f32" in validated_accel_set
             and capability.get("mps_graph_probe_requested") is True
@@ -12503,26 +12520,45 @@ def _launch_audit_from_health(
             if isinstance(capability, dict)
             else None
         ),
+        mpp_run_probe_requested=(
+            capability.get("mpp_run_probe_requested")
+            if isinstance(capability, dict)
+            else None
+        ),
+        mpp_run_probe_ran=(
+            capability.get("mpp_run_probe_ran")
+            if isinstance(capability, dict)
+            else None
+        ),
+        mpp_run_probe_ok=(
+            capability.get("mpp_run_probe_ok")
+            if isinstance(capability, dict)
+            else None
+        ),
+        runtime_probe_backend=runtime_probe_backend,
     )
     applied_profile_flags = (
         set(_launch_profile_flags(applied)) if isinstance(applied, dict) else set()
     )
-    acceleration_suggestion = (
-        capability.get("suggested_prefill_acceleration_flags")
-        if isinstance(capability, dict)
-        else None
+    runtime_probe_argv = (
+        tuple(str(item) for item in acceleration_suggestion.get("runtime_probe_argv") or ())
+        if isinstance(acceleration_suggestion, dict)
+        else ()
     )
-    profile_probe_required = prefill_required and "mpsgraph-f32" in selectable_accel
+    profile_probe_required = prefill_required and bool(runtime_probe_argv)
     profile_replays_probe = (
         not profile_probe_required
-        or "--run-mpsgraph-probe" in applied_profile_flags
+        or all(flag in applied_profile_flags for flag in runtime_probe_argv)
     )
     add(
         "prefill_acceleration_profile_replays_probe",
         profile_replays_probe,
-        "required MPSGraph acceleration launch profile must replay the runtime probe",
+        "required prefill acceleration launch profile must replay its runtime probe",
         required=profile_probe_required,
         has_run_mpsgraph_probe=("--run-mpsgraph-probe" in applied_profile_flags),
+        has_run_mpp_probe=("--run-mpp-probe" in applied_profile_flags),
+        runtime_probe_backend=runtime_probe_backend,
+        runtime_probe_argv=runtime_probe_argv,
         runtime_probe_required=(
             acceleration_suggestion.get("runtime_probe_required")
             if isinstance(acceleration_suggestion, dict)
@@ -18025,6 +18061,21 @@ def _inspect_prepared(args: argparse.Namespace) -> int:
             ),
             mps_graph_probe_ok=(
                 capability.get("mps_graph_probe_ok")
+                if isinstance(capability, dict)
+                else None
+            ),
+            mpp_run_probe_requested=(
+                capability.get("mpp_run_probe_requested")
+                if isinstance(capability, dict)
+                else None
+            ),
+            mpp_run_probe_ran=(
+                capability.get("mpp_run_probe_ran")
+                if isinstance(capability, dict)
+                else None
+            ),
+            mpp_run_probe_ok=(
+                capability.get("mpp_run_probe_ok")
                 if isinstance(capability, dict)
                 else None
             ),

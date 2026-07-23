@@ -18,6 +18,7 @@ from .prompt_prefill import prompt_prefill_acceleration_failure_reason
 from .prefill_execute import (
     AUTO_MPSGRAPH_MIN_BATCH_TOKENS,
     AUTO_MPSGRAPH_MIN_DIM,
+    PREFILL_LINEAR_AUTO_MPP_BACKEND,
     PREFILL_LINEAR_ACCELERATED_BACKENDS,
     PREFILL_LINEAR_F32_CONVERSION_BACKENDS,
     PREFILL_LINEAR_MPSGRAPH_DTYPES,
@@ -716,9 +717,13 @@ def _benchmark_prefill_linear_summary(
                 backend = "unsupported-mpsgraph"
             else:
                 backend = prefill_linear_backend
-        elif prefill_linear_backend == "auto":
+        elif prefill_linear_backend in {"auto", PREFILL_LINEAR_AUTO_MPP_BACKEND}:
             backend = (
-                "mpsgraph-f32"
+                (
+                    "mpp-f32"
+                    if prefill_linear_backend == PREFILL_LINEAR_AUTO_MPP_BACKEND
+                    else "mpsgraph-f32"
+                )
                 if dtype in PREFILL_LINEAR_MPSGRAPH_DTYPES
                 and prompt_chunk_tokens >= mpsgraph_min_batch_tokens
                 and min(rows, cols) >= mpsgraph_min_matrix_dim

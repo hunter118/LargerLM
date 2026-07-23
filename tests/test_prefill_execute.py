@@ -21,6 +21,7 @@ from largerlm.prefill_execute import (
     ResidentLinearCalibrationCase,
     ResidentLinearCalibrationResult,
     RopeSplitBatchServerSession,
+    _resolve_prefill_linear_backend,
     run_prefill_attention_block_batch,
     run_prefill_attention_projection_batch,
     run_prefill_attention_output_batch,
@@ -1856,6 +1857,34 @@ def test_run_resident_batch_linear_auto_selects_mpsgraph_for_large_bf16(
     )
     argv = json.loads(output.with_suffix(output.suffix + ".argv.json").read_text())
     assert argv[argv.index("--prefill-linear-backend") + 1] == "mpsgraph-f32"
+
+
+@pytest.mark.parametrize(
+    ("dtype", "expected"),
+    (
+        ("BF16", "mpp-f32"),
+        ("F16", "mpp-f32"),
+        ("F32", "mpp-f32"),
+        ("mlx-mxfp4", "custom-metal"),
+        ("affine-int4", "custom-metal"),
+    ),
+)
+def test_auto_mpp_selects_mpp_only_for_supported_resident_matrices(
+    dtype: str,
+    expected: str,
+) -> None:
+    assert (
+        _resolve_prefill_linear_backend(
+            "auto-mpp",
+            dtype,
+            batch_tokens=128,
+            in_dim=32,
+            out_dim=32,
+            mpsgraph_min_batch_tokens=128,
+            mpsgraph_min_matrix_dim=32,
+        )
+        == expected
+    )
 
 
 def test_run_resident_batch_linear_rejects_wrong_input_size(tmp_path: Path) -> None:

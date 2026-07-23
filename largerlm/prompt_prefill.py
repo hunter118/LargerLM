@@ -25,6 +25,7 @@ from .generation_guard import (
 from .prefill_execute import (
     AUTO_MPSGRAPH_MIN_BATCH_TOKENS,
     AUTO_MPSGRAPH_MIN_DIM,
+    PREFILL_LINEAR_AUTO_MPP_BACKEND,
     PREFILL_LINEAR_ACCELERATED_BACKENDS,
     PREFILL_LINEAR_F32_CONVERSION_BACKENDS,
     PREFILL_LINEAR_MPSGRAPH_DTYPES,
@@ -828,9 +829,13 @@ def _prefill_linear_summary_from_layout(
                 backend = "unsupported-mpsgraph"
             else:
                 backend = prefill_linear_backend
-        elif prefill_linear_backend == "auto":
+        elif prefill_linear_backend in {"auto", PREFILL_LINEAR_AUTO_MPP_BACKEND}:
             backend = (
-                "mpsgraph-f32"
+                (
+                    "mpp-f32"
+                    if prefill_linear_backend == PREFILL_LINEAR_AUTO_MPP_BACKEND
+                    else "mpsgraph-f32"
+                )
                 if dtype in PREFILL_LINEAR_MPSGRAPH_DTYPES
                 and prompt_chunk_tokens >= mpsgraph_min_batch_tokens
                 and min(rows, cols) >= mpsgraph_min_matrix_dim
@@ -1184,7 +1189,7 @@ def _prefill_acceleration_frontier_from_layout(
         reason = "effective prefill backend is custom-metal"
         suggested = None
     elif (
-        prefill_linear_backend == "auto"
+        prefill_linear_backend in {"auto", PREFILL_LINEAR_AUTO_MPP_BACKEND}
         and mpsgraph_min_batch_tokens > prompt_token_count
     ):
         reason = "prompt token count is below the MPSGraph auto threshold"
@@ -1211,7 +1216,9 @@ def _prefill_acceleration_frontier_from_layout(
             "execution_path": "mpp_tensor_ops_gpu_neural_accelerator",
             "mpp_tensor_ops_min_batch_tokens": DEFAULT_MPP_MIN_TOKENS,
             "mpp_tensor_ops_min_matrix_dim": MPP_TENSOR_OPS_MIN_MATRIX_DIM,
-            "selectable_prefill_backend": False,
+            "selectable_prefill_backend": (
+                prefill_linear_backend == PREFILL_LINEAR_AUTO_MPP_BACKEND
+            ),
         },
         "minimum_accelerated_prompt_chunk_tokens": minimum_accelerated,
         "suggested_guard_flags": suggested,

@@ -32,6 +32,7 @@ from .generation_guard import (
 from .prefill_execute import (
     AUTO_MPSGRAPH_MIN_BATCH_TOKENS,
     AUTO_MPSGRAPH_MIN_DIM,
+    PREFILL_LINEAR_AUTO_MPP_BACKEND,
     PREFILL_LINEAR_BACKENDS,
     PREFILL_LINEAR_F32_CONVERSION_BACKENDS,
     PREFILL_LINEAR_MPSGRAPH_DTYPES,
@@ -986,7 +987,7 @@ def _auto_prefill_matrix_scratch_bytes(
     use_f32_conversion_backend = (
         prefill_linear_backend in PREFILL_LINEAR_F32_CONVERSION_BACKENDS
     )
-    if prefill_linear_backend == "auto":
+    if prefill_linear_backend in {"auto", PREFILL_LINEAR_AUTO_MPP_BACKEND}:
         use_f32_conversion_backend = (
             dtype in PREFILL_LINEAR_MPSGRAPH_DTYPES
             and batch_tokens >= prefill_mpsgraph_min_batch_tokens

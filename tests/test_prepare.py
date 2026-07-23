@@ -15637,14 +15637,21 @@ def test_inspect_prepared_cli_require_launch_audit_accepts_locked_glm_request(
         "largerlm.server.inspect_prefill_backend",
         lambda **kwargs: SimpleNamespace(
             sdk_path=tmp_path / "MacOSX.sdk",
-            recommended_backend="mpsgraph_prefill_fallback",
-            mps_graph_runtime_available=True,
+            recommended_backend="mpp_tensor_ops_prefill",
+            mps_graph_runtime_available=False,
             mps_graph_matmul_declared=True,
-            mps_graph_probe_ran=True,
-            mps_graph_probe_ok=True,
+            mps_graph_probe_ran=False,
+            mps_graph_probe_ok=None,
             mps_graph_probe_error=None,
-            metal4_ml_runtime_available=False,
-            mpp_runtime_available=False,
+            metal4_ml_runtime_available=True,
+            mpp_runtime_available=True,
+            mpp_run_probe_requested=True,
+            mpp_run_probe_ran=True,
+            mpp_run_probe_ok=True,
+            host_probe_requested=True,
+            host_probe_path=tmp_path / "prefill-backend-probe",
+            host_probe_ran=True,
+            host_probe_ok=True,
             reasons=(),
         ),
     )
@@ -15671,7 +15678,7 @@ def test_inspect_prepared_cli_require_launch_audit_accepts_locked_glm_request(
         "1",
         "--decode-max-routed-read-seconds-per-token",
         "5",
-        "--run-mpsgraph-probe",
+        "--run-mpp-probe",
     ]
     profile = _write_matching_launch_profile(
         tmp_path / "launch-profile.json",
@@ -15694,7 +15701,7 @@ def test_inspect_prepared_cli_require_launch_audit_accepts_locked_glm_request(
             "--check-max-new-tokens",
             "1",
             "--check-runtime-preflight",
-            "--run-mpsgraph-probe",
+            "--run-mpp-probe",
             "--require-launch-audit",
             "--write-launch-audit",
             str(audit_path),
@@ -15702,9 +15709,12 @@ def test_inspect_prepared_cli_require_launch_audit_accepts_locked_glm_request(
         ]
     )
 
-    assert status == 0
     health = json.loads(capsys.readouterr().out)
     audit = health["launch_audit"]
+    assert status == 0, (
+        audit["failures"],
+        health.get("prefill_acceleration_requirement"),
+    )
     assert audit["ok"] is True
     assert audit["failures"] == []
     assert all(check["ok"] is True for check in audit["checks"])
@@ -15726,25 +15736,27 @@ def test_inspect_prepared_cli_require_launch_audit_accepts_locked_glm_request(
     )
     assert acceleration_check["ok"] is True
     assert acceleration_check["reason_code"] == "ok"
-    assert acceleration_check["recommended_backend"] == "mpsgraph_prefill_fallback"
-    assert acceleration_check["prefill_acceleration_runtimes"] == ["mpsgraph-f32"]
-    assert acceleration_check["selectable_accelerated_prefill_backends"] == [
-        "mpsgraph-f32"
+    assert acceleration_check["recommended_backend"] == "mpp_tensor_ops_prefill"
+    assert acceleration_check["prefill_acceleration_runtimes"] == [
+        "mpp_tensor_ops_prefill"
     ]
-    assert acceleration_check["mps_graph_probe_requested"] is True
-    assert acceleration_check["mps_graph_probe_ran"] is True
-    assert acceleration_check["mps_graph_probe_ok"] is True
+    assert acceleration_check["selectable_accelerated_prefill_backends"] == [
+        "mpp-f32"
+    ]
+    assert acceleration_check["mpp_run_probe_requested"] is True
+    assert acceleration_check["mpp_run_probe_ran"] is True
+    assert acceleration_check["mpp_run_probe_ok"] is True
     assert acceleration_check["host_probe_requested"] is True
     assert acceleration_check["host_probe_path"]
     assert acceleration_check["host_probe_ran"] is True
     assert acceleration_check["host_probe_ok"] is True
     assert acceleration_check["prefill_backend_probe_timeout_seconds"] == 5.0
-    assert acceleration_check["mpp_runtime_available"] is False
+    assert acceleration_check["mpp_runtime_available"] is True
     assert acceleration_check["prefill_neural_accelerator_status"]["runtime"] == (
         "mpp_tensor_ops_prefill"
     )
     assert acceleration_check["prefill_neural_accelerator_status"]["status"] == (
-        "unavailable"
+        "selectable"
     )
     expected_slot_bytes = sum(component[2] for component in COMPONENTS)
     glm_check = next(

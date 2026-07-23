@@ -50,6 +50,7 @@ from .metal_text_generator import (
 from .prefill_execute import (
     AUTO_MPSGRAPH_MIN_BATCH_TOKENS,
     AUTO_MPSGRAPH_MIN_DIM,
+    PREFILL_LINEAR_AUTO_MPP_BACKEND,
     PREFILL_LINEAR_ACCELERATED_BACKENDS,
     PREFILL_LINEAR_F32_CONVERSION_BACKENDS,
     PREFILL_LINEAR_MPSGRAPH_DTYPES,
@@ -3458,11 +3459,13 @@ def _resolve_server_prefill_linear_backend(
         )
     except Exception:
         return "custom-metal"
-    return (
-        "auto"
-        if selectable_accelerated_prefill_backends(backend)
-        else "custom-metal"
-    )
+    validated = validated_accelerated_prefill_backends(backend)
+    if "mpp-f32" in validated:
+        return PREFILL_LINEAR_AUTO_MPP_BACKEND
+    if validated:
+        return "auto"
+    selectable = selectable_accelerated_prefill_backends(backend)
+    return "auto" if "mpsgraph-f32" in selectable else "custom-metal"
 
 
 def _server_prefill_acceleration_required(config: "PreparedServerConfig") -> bool:
@@ -3591,7 +3594,8 @@ def _prefill_linear_backend_request_summary(
             "execution_path": "mpp_tensor_ops_gpu_neural_accelerator",
             "mpp_tensor_ops_min_batch_tokens": DEFAULT_MPP_MIN_TOKENS,
             "mpp_tensor_ops_min_matrix_dim": MPP_TENSOR_OPS_MIN_MATRIX_DIM,
-            "selectable_prefill_backend": effective_backend == "mpp-f32",
+            "selectable_prefill_backend": effective_backend
+            in {"mpp-f32", PREFILL_LINEAR_AUTO_MPP_BACKEND},
         },
     }
     if prompt_chunk_tokens is None or prompt_chunk_tokens <= 0:
@@ -3702,9 +3706,13 @@ def _prefill_linear_backend_request_summary(
                 resolved_backend = "unsupported-mpsgraph"
             else:
                 resolved_backend = effective_backend
-        elif effective_backend == "auto":
+        elif effective_backend in {"auto", PREFILL_LINEAR_AUTO_MPP_BACKEND}:
             resolved_backend = (
-                "mpsgraph-f32"
+                (
+                    "mpp-f32"
+                    if effective_backend == PREFILL_LINEAR_AUTO_MPP_BACKEND
+                    else "mpsgraph-f32"
+                )
                 if dtype in PREFILL_LINEAR_MPSGRAPH_DTYPES
                 and prompt_chunk_tokens >= mpsgraph_min_batch_tokens
                 and min(rows, cols) >= mpsgraph_min_matrix_dim
@@ -4542,13 +4550,13 @@ def _prefill_acceleration_frontier_request_summary(
         reason = "no resident prefill matrices were found"
         suggested = None
     elif (
-        effective_backend == "auto"
+        effective_backend in {"auto", PREFILL_LINEAR_AUTO_MPP_BACKEND}
         and mpsgraph_min_batch_tokens > prompt_token_count
     ):
         reason = "prompt token count is below the MPSGraph auto threshold"
         suggested = None
     elif (
-        effective_backend == "auto"
+        effective_backend in {"auto", PREFILL_LINEAR_AUTO_MPP_BACKEND}
         and max_safe_chunk_tokens is not None
         and mpsgraph_min_batch_tokens > max_safe_chunk_tokens
     ):
@@ -7360,6 +7368,9 @@ class PreparedGenerationApp:
             run_mpp_probe=cfg.prefill_run_mpp_probe,
             run_mpsgraph_probe=cfg.prefill_run_mpsgraph_probe,
             probe_timeout_seconds=cfg.prefill_backend_probe_timeout_seconds,
+        )
+        prefill_backend["effective_backend"] = (
+            self.state.runtime_prefill_linear_backend
         )
         prefill_acceleration_requirement = _prefill_acceleration_requirement_health(
             cfg,

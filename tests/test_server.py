@@ -1539,6 +1539,58 @@ def test_prepared_server_auto_prefill_backend_falls_back_without_mpsgraph(
     )
 
 
+def test_prepared_server_auto_prefill_backend_prefers_validated_mpp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared = _write_minimal_prepared_manifest(tmp_path)
+    captured: dict[str, object] = {}
+
+    def fake_generate_token_ids(**kwargs):
+        captured.update(kwargs)
+        return _token_result(tmp_path, tuple(kwargs["prompt_token_ids"]))
+
+    monkeypatch.setattr("largerlm.server.generate_token_ids", fake_generate_token_ids)
+    monkeypatch.setattr(
+        "largerlm.server.inspect_prefill_backend",
+        lambda **kwargs: SimpleNamespace(
+            sdk_path=tmp_path / "MacOSX.sdk",
+            recommended_backend="mpp_tensor_ops_prefill",
+            mps_graph_matmul_declared=True,
+            mps_graph_runtime_available=True,
+            mps_graph_probe_requested=True,
+            mps_graph_probe_ran=True,
+            mps_graph_probe_ok=True,
+            metal4_ml_runtime_available=True,
+            mpp_runtime_available=True,
+            mpp_run_probe_requested=True,
+            mpp_run_probe_ran=True,
+            mpp_run_probe_ok=True,
+            reasons=(),
+        ),
+    )
+    app = PreparedGenerationApp(
+        PreparedServerConfig(
+            prepared_path=prepared,
+            runner_path=Path("unused-runner"),
+            max_new_tokens_cap=4,
+            prefill_linear_backend="auto",
+            prefill_run_mpp_probe=True,
+            prefill_run_mpsgraph_probe=True,
+        )
+    )
+
+    app.generate_token_ids(
+        {
+            "prompt_token_ids": [0, 1],
+            "max_new_tokens": 1,
+        }
+    )
+
+    assert app.state.runtime_prefill_linear_backend == "auto-mpp"
+    assert captured["prefill_linear_backend"] == "auto-mpp"
+
+
 def test_prepared_server_request_check_reports_prefill_chunk_plan_drift_ok(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
