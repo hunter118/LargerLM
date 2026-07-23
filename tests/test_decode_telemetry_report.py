@@ -297,6 +297,18 @@ def test_build_report_from_generate_steps_sums_step_telemetry(tmp_path: Path) ->
     path.write_text(
         json.dumps(
             {
+                "expert_resident_cache": {
+                    "enabled": True,
+                    "entry_count": 4,
+                    "pinned_entry_count": 1,
+                    "adaptive_allocation_bytes": 2048,
+                    "eviction_count": 2,
+                    "pressure_reject_count": 0,
+                    "system_memory_after_execution": {
+                        "available_bytes": 32 * reporter.GIB,
+                        "pressure_level": 1,
+                    },
+                },
                 "probe_generate": {
                     "steps": [
                         {
@@ -324,6 +336,10 @@ def test_build_report_from_generate_steps_sums_step_telemetry(tmp_path: Path) ->
                             "expert_read_pool_dispatch_count": 1,
                             "expert_read_serial_dispatch_count": 0,
                             "expert_read_max_task_count": 4,
+                            "expert_cache_hit_bytes": 5,
+                            "expert_cache_hit_count": 1,
+                            "expert_cache_miss_count": 3,
+                            "expert_cache_store_count": 2,
                         },
                         {
                             "decode_elapsed_seconds": 2.0,
@@ -350,6 +366,10 @@ def test_build_report_from_generate_steps_sums_step_telemetry(tmp_path: Path) ->
                             "expert_read_pool_dispatch_count": 1,
                             "expert_read_serial_dispatch_count": 0,
                             "expert_read_max_task_count": 8,
+                            "expert_cache_hit_bytes": 15,
+                            "expert_cache_hit_count": 2,
+                            "expert_cache_miss_count": 6,
+                            "expert_cache_store_count": 4,
                         },
                     ]
                 }
@@ -370,6 +390,24 @@ def test_build_report_from_generate_steps_sums_step_telemetry(tmp_path: Path) ->
     assert report["bytes"]["expert_bytes_read"] == 30
     assert report["expert_read"]["task_count"] == 12
     assert report["expert_read"]["max_task_count"] == 8
+    assert report["expert_cache"]["enabled"] is True
+    assert report["expert_cache"]["hit_bytes"] == 20
+    assert report["expert_cache"]["hit_count"] == 3
+    assert report["expert_cache"]["miss_count"] == 9
+    assert report["expert_cache"]["store_count"] == 6
+    assert report["expert_cache"]["hit_rate"] == 0.25
+    assert report["expert_cache"]["logical_expert_bytes"] == 50
+    assert report["expert_cache"]["byte_hit_rate"] == 0.4
+    assert report["expert_cache"]["entry_count"] == 4
+    assert report["expert_cache"]["pinned_entry_count"] == 1
+    assert report["expert_cache"]["adaptive_allocation_bytes"] == 2048
+    assert report["expert_cache"]["eviction_count"] == 2
+    assert report["expert_cache"]["pressure_reject_count"] == 0
+    assert (
+        report["expert_cache"]["system_available_memory_after_execution"]
+        == 32 * reporter.GIB
+    )
+    assert report["expert_cache"]["memory_pressure_level_after_execution"] == 1
     nested = {
         item["label"]: item["seconds"]
         for item in report["timing"]["nested_components"]
@@ -552,6 +590,18 @@ def test_build_report_from_flat_metal_generate_result() -> None:
         "decode_expert_read_task_count": [600, 600, 600],
         "decode_expert_read_pool_dispatch_count": [75, 75, 75],
         "decode_expert_read_serial_dispatch_count": [0, 0, 0],
+        "decode_expert_cache_hit_bytes": [50, 100, 150],
+        "decode_expert_cache_hit_count": [1, 2, 3],
+        "decode_expert_cache_miss_count": [7, 6, 5],
+        "decode_expert_cache_store_count": [1, 2, 3],
+        "expert_cache_enabled": True,
+        "expert_cache_entry_count": 10,
+        "expert_cache_pinned_entry_count": 2,
+        "expert_cache_adaptive_allocation_bytes": 4096,
+        "expert_cache_eviction_count": 4,
+        "expert_cache_pressure_reject_count": 1,
+        "expert_cache_system_available_memory_after_execution": 24 * reporter.GIB,
+        "expert_cache_memory_pressure_level_after_execution": 1,
     }
 
     report = reporter.build_decode_telemetry_report(payload)
@@ -573,6 +623,20 @@ def test_build_report_from_flat_metal_generate_result() -> None:
     assert report["bytes"]["final_logits_lm_head_bytes_read"] == 960
     assert report["expert_read"]["task_count"] == 1800
     assert report["expert_read"]["pool_dispatch_count"] == 225
+    assert report["expert_cache"]["enabled"] is True
+    assert report["expert_cache"]["hit_bytes"] == 300
+    assert report["expert_cache"]["hit_count"] == 6
+    assert report["expert_cache"]["miss_count"] == 18
+    assert report["expert_cache"]["hit_rate"] == 0.25
+    assert report["expert_cache"]["logical_expert_bytes"] == 900
+    assert report["expert_cache"]["byte_hit_rate"] == 1 / 3
+    assert report["expert_cache"]["entry_count"] == 10
+    assert report["expert_cache"]["eviction_count"] == 4
+    assert report["expert_cache"]["pressure_reject_count"] == 1
+    assert (
+        report["expert_cache"]["system_available_memory_after_execution"]
+        == 24 * reporter.GIB
+    )
     assert report["command_buffers"]["count"] == 600
     assert report["command_buffers"]["synchronous_wait_count_estimate"] == 450
     assert report["command_buffers"]["moe_mlp_count"] == 225

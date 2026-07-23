@@ -103,6 +103,10 @@ SUM_FIELDS = {
     "expert_read_task_count",
     "expert_read_pool_dispatch_count",
     "expert_read_serial_dispatch_count",
+    "expert_cache_hit_bytes",
+    "expert_cache_hit_count",
+    "expert_cache_miss_count",
+    "expert_cache_store_count",
 }
 
 MAX_FIELDS = {
@@ -165,7 +169,11 @@ def _sum_step_payloads(steps: list[Any]) -> dict[str, Any]:
     )
     for key in SUM_FIELDS:
         total = sum(_number(step, key) for step in step_dicts)
-        if key.endswith("_count") or key.endswith("_bytes_read"):
+        if (
+            key.endswith("_count")
+            or key.endswith("_bytes_read")
+            or key.endswith("_bytes")
+        ):
             aggregate[key] = int(total)
         else:
             aggregate[key] = total
@@ -230,7 +238,11 @@ def _sum_flat_generation_payload(payload: dict[str, Any]) -> dict[str, Any]:
     )
     for key in SUM_FIELDS:
         total = sum(_flat_generation_values(payload, key))
-        if key.endswith("_count") or key.endswith("_bytes_read"):
+        if (
+            key.endswith("_count")
+            or key.endswith("_bytes_read")
+            or key.endswith("_bytes")
+        ):
             aggregate[key] = int(total)
         else:
             aggregate[key] = total
@@ -618,6 +630,125 @@ def _attn_output_timing_label(decode: dict[str, Any]) -> str:
     return "attn_output"
 
 
+def _selected_runtime_payload(
+    payload: dict[str, Any],
+    source_kind: str,
+) -> dict[str, Any]:
+    if source_kind == "payload_steps":
+        nested = payload.get("payload")
+        return nested if isinstance(nested, dict) else payload
+    if source_kind == "request_last_steps":
+        requests = payload.get("requests")
+        if isinstance(requests, list):
+            for request in reversed(requests):
+                if not isinstance(request, dict):
+                    continue
+                nested = request.get("payload")
+                if isinstance(nested, dict) and isinstance(
+                    nested.get("steps"),
+                    list,
+                ):
+                    return nested
+    return payload
+
+
+def _optional_integer(payload: dict[str, Any], key: str) -> int | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise DecodeTelemetryReportError(f"{key} must be an integer") from exc
+
+
+def _optional_boolean(payload: dict[str, Any], key: str) -> bool | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    raise DecodeTelemetryReportError(f"{key} must be a boolean")
+
+
+def _expert_cache_summary(
+    payload: dict[str, Any],
+    source_kind: str,
+    decode: dict[str, Any],
+    *,
+    expert_bytes_read: int,
+    token_count: int,
+) -> dict[str, Any]:
+    runtime = _selected_runtime_payload(payload, source_kind)
+    native = runtime.get("expert_resident_cache")
+    native_cache = native if isinstance(native, dict) else {}
+    native_memory = native_cache.get("system_memory_after_execution")
+    memory = native_memory if isinstance(native_memory, dict) else {}
+
+    hit_bytes = _integer(decode, "expert_cache_hit_bytes")
+    hit_count = _integer(decode, "expert_cache_hit_count")
+    miss_count = _integer(decode, "expert_cache_miss_count")
+    store_count = _integer(decode, "expert_cache_store_count")
+    logical_expert_bytes = expert_bytes_read + hit_bytes
+    access_count = hit_count + miss_count
+
+    enabled = _optional_boolean(native_cache, "enabled")
+    if enabled is None:
+        enabled = _optional_boolean(runtime, "expert_cache_enabled")
+
+    def cache_int(native_key: str, flat_key: str) -> int | None:
+        value = _optional_integer(native_cache, native_key)
+        return value if value is not None else _optional_integer(runtime, flat_key)
+
+    available_memory = _optional_integer(memory, "available_bytes")
+    if available_memory is None:
+        available_memory = _optional_integer(
+            runtime,
+            "expert_cache_system_available_memory_after_execution",
+        )
+    pressure_level = _optional_integer(memory, "pressure_level")
+    if pressure_level is None:
+        pressure_level = _optional_integer(
+            runtime,
+            "expert_cache_memory_pressure_level_after_execution",
+        )
+
+    return {
+        "enabled": enabled,
+        "hit_bytes": hit_bytes,
+        "hit_count": hit_count,
+        "miss_count": miss_count,
+        "store_count": store_count,
+        "access_count": access_count,
+        "hit_rate": hit_count / access_count if access_count > 0 else None,
+        "logical_expert_bytes": logical_expert_bytes,
+        "logical_expert_bytes_per_token": logical_expert_bytes / token_count,
+        "ssd_expert_bytes_per_token": expert_bytes_read / token_count,
+        "byte_hit_rate": (
+            hit_bytes / logical_expert_bytes if logical_expert_bytes > 0 else None
+        ),
+        "entry_count": cache_int("entry_count", "expert_cache_entry_count"),
+        "pinned_entry_count": cache_int(
+            "pinned_entry_count",
+            "expert_cache_pinned_entry_count",
+        ),
+        "adaptive_allocation_bytes": cache_int(
+            "adaptive_allocation_bytes",
+            "expert_cache_adaptive_allocation_bytes",
+        ),
+        "eviction_count": cache_int(
+            "eviction_count",
+            "expert_cache_eviction_count",
+        ),
+        "pressure_reject_count": cache_int(
+            "pressure_reject_count",
+            "expert_cache_pressure_reject_count",
+        ),
+        "system_available_memory_after_execution": available_memory,
+        "memory_pressure_level_after_execution": pressure_level,
+    }
+
+
 def build_decode_telemetry_report(
     payload: dict[str, Any],
     *,
@@ -691,6 +822,13 @@ def build_decode_telemetry_report(
         if dense_wait_count_available
         else _integer(decode, "dense_mlp_command_buffer_count")
     )
+    expert_cache = _expert_cache_summary(
+        payload,
+        source_kind,
+        decode,
+        expert_bytes_read=expert_bytes,
+        token_count=token_count,
+    )
 
     return {
         "schema": "largerlm.decode_telemetry_report.v1",
@@ -756,6 +894,7 @@ def build_decode_telemetry_report(
             "serial_dispatch_count": serial_dispatches,
             "pooled_read_ok": pooled_read_ok,
         },
+        "expert_cache": expert_cache,
         "shared_read": {
             "bytes_read": _integer(decode, "shared_bytes_read"),
             "seconds": _number(decode, "shared_read_seconds"),
@@ -928,6 +1067,42 @@ def _print_text(report: dict[str, Any]) -> None:
         f"{report['expert_read']['pool_dispatch_count']} pooled, "
         f"{report['expert_read']['serial_dispatch_count']} serial"
     )
+    expert_cache = report.get("expert_cache")
+    if isinstance(expert_cache, dict) and (
+        expert_cache.get("enabled") is not None
+        or int(expert_cache.get("access_count") or 0) > 0
+    ):
+        hit_rate = expert_cache.get("hit_rate")
+        byte_hit_rate = expert_cache.get("byte_hit_rate")
+        print(
+            "  expert cache:         "
+            f"enabled={expert_cache.get('enabled')} "
+            f"hits={int(expert_cache.get('hit_count') or 0)} "
+            f"misses={int(expert_cache.get('miss_count') or 0)}"
+            + (f" ({float(hit_rate):.1%} hits)" if hit_rate is not None else "")
+        )
+        print(
+            "  expert cache bytes:   "
+            f"{int(expert_cache.get('ssd_expert_bytes_per_token') or 0) / GIB:.3f} "
+            "GiB SSD/token"
+            + (
+                f", {float(byte_hit_rate):.1%} cached"
+                if byte_hit_rate is not None
+                else ""
+            )
+        )
+        available = expert_cache.get("system_available_memory_after_execution")
+        pressure = expert_cache.get("memory_pressure_level_after_execution")
+        if available is not None or pressure is not None:
+            print(
+                "  memory after run:     "
+                + (
+                    f"{int(available) / GIB:.1f} GiB available"
+                    if available is not None
+                    else "available unknown"
+                )
+                + f", pressure={pressure}"
+            )
     command_buffers = report["command_buffers"]
     if command_buffers["count"]:
         print(
