@@ -39,6 +39,9 @@ LargerLM demonstrates that a GLM-style MoE checkpoint can be split into:
 The project also provides a quality-preserving expert-usage profiler, pin
 planner, and bounded runtime expert cache. It can learn a hot set from
 LargerLM telemetry, router JSON/JSONL, or Colibri `.coli_usage` files.
+On M5-class Macs, `mpp-f32` is an opt-in MPP TensorOps backend for resident
+F32/BF16/F16 prefill GEMMs; routed MXFP4 experts remain on the bounded custom
+Metal path.
 
 ## Device Requirements
 

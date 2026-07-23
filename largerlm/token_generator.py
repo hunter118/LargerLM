@@ -1192,8 +1192,8 @@ def _auto_prefill_prompt_chunk_plan(
         raise TokenGeneratorError("top_k must be positive for prefill auto chunk sizing")
     if prefill_linear_backend not in PREFILL_LINEAR_BACKENDS:
         raise TokenGeneratorError(
-            "prefill_linear_backend must be custom-metal, mpsgraph-f32, "
-            "mps-matrix-f32, or auto"
+            "prefill_linear_backend must be custom-metal, mpp-f32, "
+            "mpsgraph-f32, mps-matrix-f32, or auto"
         )
     prefill_mpsgraph_min_batch_tokens = _positive_integer_value(
         prefill_mpsgraph_min_batch_tokens,

@@ -11984,7 +11984,7 @@ def test_generate_prepared_token_ids_require_prefill_acceleration_rejects_mpp_on
     assert status == 1
     err = capsys.readouterr().err
     assert "prefill acceleration requirement failed" in err
-    assert "no selectable MPP prefill backend is implemented" in err
+    assert "requires --run-mpp-probe" in err
 
 
 def test_generate_prepared_text_require_prefill_acceleration_allows_mpsgraph(
@@ -16065,10 +16065,10 @@ def test_inspect_prepared_cli_compile_mpp_probe_reaches_backend_health(
     assert capability["mpp_compile_probe_ok"] is True
     assert capability["mpp_compile_variant"] == "metal_mpp"
     neural_status = capability["prefill_neural_accelerator_status"]
-    assert neural_status["status"] == "runtime_visible_not_selectable"
+    assert neural_status["status"] == "selectable"
     assert neural_status["mpp_tensor_ops_symbol_declared"] is True
     assert neural_status["mpp_compile_probe_requested"] is True
-    assert neural_status["ready_for_generation"] is False
+    assert neural_status["ready_for_generation"] is True
     probe_flags = health["suggested_prefill_backend_probe_flags"]
     assert probe_flags == {
         "source": "prepared_health",
@@ -16133,8 +16133,8 @@ def test_inspect_prepared_cli_run_mpp_probe_reaches_backend_health(
     assert capability["mpp_run_probe_requested"] is True
     assert capability["mpp_run_probe_ok"] is True
     neural_status = capability["prefill_neural_accelerator_status"]
-    assert neural_status["status"] == "runtime_executed_not_selectable"
-    assert neural_status["ready_for_generation"] is False
+    assert neural_status["status"] == "selectable"
+    assert neural_status["ready_for_generation"] is True
     probe_flags = health["suggested_prefill_backend_probe_flags"]
     assert probe_flags == {
         "source": "prepared_health",

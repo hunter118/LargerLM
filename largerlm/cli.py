@@ -10039,6 +10039,9 @@ def _prefill_acceleration_gate(
     mps_graph_probe_requested: bool | None = None,
     mps_graph_probe_ran: bool | None = None,
     mps_graph_probe_ok: bool | None = None,
+    mpp_run_probe_requested: bool | None = None,
+    mpp_run_probe_ran: bool | None = None,
+    mpp_run_probe_ok: bool | None = None,
     selectable_backends: tuple[str, ...] = (),
     acceleration_runtimes: tuple[str, ...] = (),
 ) -> dict[str, object]:
@@ -10049,6 +10052,9 @@ def _prefill_acceleration_gate(
         mps_graph_probe_requested=mps_graph_probe_requested,
         mps_graph_probe_ran=mps_graph_probe_ran,
         mps_graph_probe_ok=mps_graph_probe_ok,
+        mpp_run_probe_requested=mpp_run_probe_requested,
+        mpp_run_probe_ran=mpp_run_probe_ran,
+        mpp_run_probe_ok=mpp_run_probe_ok,
         selectable_backends=selectable_backends,
         acceleration_runtimes=acceleration_runtimes,
     ).to_json()
@@ -10112,6 +10118,13 @@ def _require_prefill_acceleration_if_requested(args: argparse.Namespace) -> None
         ),
         mps_graph_probe_ran=getattr(capability, "mps_graph_probe_ran", None),
         mps_graph_probe_ok=getattr(capability, "mps_graph_probe_ok", None),
+        mpp_run_probe_requested=getattr(
+            capability,
+            "mpp_run_probe_requested",
+            None,
+        ),
+        mpp_run_probe_ran=getattr(capability, "mpp_run_probe_ran", None),
+        mpp_run_probe_ok=getattr(capability, "mpp_run_probe_ok", None),
         selectable_backends=selectable_accelerated_prefill_backends(capability),
         acceleration_runtimes=prefill_acceleration_runtimes(capability),
     )
@@ -11242,7 +11255,7 @@ def _request_prefill_acceleration_profile_flags(
         if isinstance(request_backend_policy_flags, dict)
         else None
     )
-    if request_backend_name not in {None, "auto", "mpsgraph-f32"}:
+    if request_backend_name not in {None, "auto", "mpp-f32", "mpsgraph-f32"}:
         return None
     if request_backend_name is not None:
         return acceleration_flags
@@ -18549,7 +18562,7 @@ def _add_batch_prefill_prompt_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--prefill-linear-backend",
-        choices=("custom-metal", "mpsgraph-f32", "mps-matrix-f32", "auto"),
+        choices=("custom-metal", "mpp-f32", "mpsgraph-f32", "mps-matrix-f32", "auto"),
         default="auto",
     )
     parser.add_argument(
@@ -18862,7 +18875,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     prefill_plan.add_argument(
         "--prefill-linear-backend",
-        choices=("custom-metal", "mpsgraph-f32", "mps-matrix-f32", "auto"),
+        choices=("custom-metal", "mpp-f32", "mpsgraph-f32", "mps-matrix-f32", "auto"),
         default="auto",
         help="include this resident GEMM backend policy in the launch profile",
     )
@@ -18932,7 +18945,7 @@ def build_parser() -> argparse.ArgumentParser:
     prefill_plan_calibrate.add_argument("--mpp-min-tokens", type=int, default=128)
     prefill_plan_calibrate.add_argument(
         "--prefill-linear-backend",
-        choices=("custom-metal", "mpsgraph-f32", "mps-matrix-f32", "auto"),
+        choices=("custom-metal", "mpp-f32", "mpsgraph-f32", "mps-matrix-f32", "auto"),
         default="auto",
         help="include this resident GEMM backend policy in the merged launch profile",
     )
@@ -19137,7 +19150,7 @@ def build_parser() -> argparse.ArgumentParser:
     prefill_linear.add_argument("--max-runner-scratch-mib", type=int, default=4096)
     prefill_linear.add_argument(
         "--prefill-linear-backend",
-        choices=("custom-metal", "mpsgraph-f32", "mps-matrix-f32", "auto"),
+        choices=("custom-metal", "mpp-f32", "mpsgraph-f32", "mps-matrix-f32", "auto"),
         default="custom-metal",
     )
     prefill_linear.add_argument(
@@ -19287,7 +19300,7 @@ def build_parser() -> argparse.ArgumentParser:
     prefill_prefix.add_argument("--max-runner-scratch-mib", type=int, default=4096)
     prefill_prefix.add_argument(
         "--prefill-linear-backend",
-        choices=("custom-metal", "mpsgraph-f32", "mps-matrix-f32", "auto"),
+        choices=("custom-metal", "mpp-f32", "mpsgraph-f32", "mps-matrix-f32", "auto"),
         default="custom-metal",
     )
     prefill_prefix.add_argument("--quiet-runner", action="store_true")
@@ -19344,7 +19357,7 @@ def build_parser() -> argparse.ArgumentParser:
     prefill_projections.add_argument("--max-runner-scratch-mib", type=int, default=4096)
     prefill_projections.add_argument(
         "--prefill-linear-backend",
-        choices=("custom-metal", "mpsgraph-f32", "mps-matrix-f32", "auto"),
+        choices=("custom-metal", "mpp-f32", "mpsgraph-f32", "mps-matrix-f32", "auto"),
         default="custom-metal",
     )
     prefill_projections.add_argument("--quiet-runner", action="store_true")
@@ -19492,7 +19505,7 @@ def build_parser() -> argparse.ArgumentParser:
     prefill_attn_out.add_argument("--max-runner-scratch-mib", type=int, default=4096)
     prefill_attn_out.add_argument(
         "--prefill-linear-backend",
-        choices=("custom-metal", "mpsgraph-f32", "mps-matrix-f32", "auto"),
+        choices=("custom-metal", "mpp-f32", "mpsgraph-f32", "mps-matrix-f32", "auto"),
         default="custom-metal",
     )
     prefill_attn_out.add_argument("--quiet-runner", action="store_true")
@@ -19548,7 +19561,7 @@ def build_parser() -> argparse.ArgumentParser:
     prefill_attn_block.add_argument("--max-runner-scratch-mib", type=int, default=4096)
     prefill_attn_block.add_argument(
         "--prefill-linear-backend",
-        choices=("custom-metal", "mpsgraph-f32", "mps-matrix-f32", "auto"),
+        choices=("custom-metal", "mpp-f32", "mpsgraph-f32", "mps-matrix-f32", "auto"),
         default="custom-metal",
     )
     prefill_attn_block.add_argument("--quiet-runner", action="store_true")
@@ -19591,7 +19604,7 @@ def build_parser() -> argparse.ArgumentParser:
     prefill_dense_mlp.add_argument("--max-runner-scratch-mib", type=int, default=4096)
     prefill_dense_mlp.add_argument(
         "--prefill-linear-backend",
-        choices=("custom-metal", "mpsgraph-f32", "mps-matrix-f32", "auto"),
+        choices=("custom-metal", "mpp-f32", "mpsgraph-f32", "mps-matrix-f32", "auto"),
         default="custom-metal",
     )
     prefill_dense_mlp.add_argument("--quiet-runner", action="store_true")
@@ -19683,7 +19696,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     prefill_staged_routed_mlp.add_argument(
         "--prefill-linear-backend",
-        choices=("custom-metal", "mpsgraph-f32", "mps-matrix-f32", "auto"),
+        choices=("custom-metal", "mpp-f32", "mpsgraph-f32", "mps-matrix-f32", "auto"),
         default="custom-metal",
     )
     prefill_staged_routed_mlp.add_argument(
@@ -20838,7 +20851,7 @@ def build_parser() -> argparse.ArgumentParser:
     prefill_prompt.add_argument("--rms-norm-eps", type=float, default=None)
     prefill_prompt.add_argument(
         "--prefill-linear-backend",
-        choices=("custom-metal", "mpsgraph-f32", "mps-matrix-f32", "auto"),
+        choices=("custom-metal", "mpp-f32", "mpsgraph-f32", "mps-matrix-f32", "auto"),
         default="auto",
     )
     prefill_prompt.add_argument(
@@ -21960,7 +21973,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     inspect_prepared.add_argument(
         "--prefill-linear-backend",
-        choices=("custom-metal", "mpsgraph-f32", "mps-matrix-f32", "auto"),
+        choices=("custom-metal", "mpp-f32", "mpsgraph-f32", "mps-matrix-f32", "auto"),
         default="auto",
     )
     inspect_prepared.add_argument(
@@ -22314,7 +22327,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     serve.add_argument(
         "--prefill-linear-backend",
-        choices=("custom-metal", "mpsgraph-f32", "mps-matrix-f32", "auto"),
+        choices=("custom-metal", "mpp-f32", "mpsgraph-f32", "mps-matrix-f32", "auto"),
         default="auto",
     )
     serve.add_argument(

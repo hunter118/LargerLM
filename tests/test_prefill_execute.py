@@ -1206,6 +1206,32 @@ def test_run_resident_batch_linear_can_select_mpsgraph_backend(tmp_path: Path) -
     assert argv[argv.index("--prefill-linear-backend") + 1] == "mpsgraph-f32"
 
 
+def test_run_resident_batch_linear_can_select_mpp_backend(tmp_path: Path) -> None:
+    layout = _write_resident(tmp_path)
+    input_path = _write_input(tmp_path)
+    runner = _write_fake_runner(tmp_path)
+    output = tmp_path / "out.f32"
+
+    result = run_resident_batch_linear(
+        runner_path=runner,
+        resident_layout_path=layout,
+        layer=1,
+        tensor_suffix=".self_attn.q_a_proj.weight",
+        input_f32_path=input_path,
+        output_f32_path=output,
+        batch_tokens=2,
+        prefill_linear_backend="mpp-f32",
+        echo_runner_output=False,
+    )
+
+    assert result.backend == "mpp-f32"
+    assert result.matrix_scratch_bytes == 2 * 1024 * 1024
+    assert result.matrix_f32_bytes == 2 * 3 * 4
+    assert result.matrix_raw_conversion_bytes == 0
+    argv = json.loads(output.with_suffix(output.suffix + ".argv.json").read_text())
+    assert argv[argv.index("--prefill-linear-backend") + 1] == "mpp-f32"
+
+
 def test_run_resident_batch_linear_can_select_mps_matrix_backend(
     tmp_path: Path,
 ) -> None:

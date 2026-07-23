@@ -1192,13 +1192,19 @@ reporting execution evidence, including the kernel include variant, `32x32x32`
 tile shape, dtype, and MPP execution primitive when the run reaches a pipeline;
 it is an inspection/bring-up probe, not a generation backend selector. The same
 status is included in prepared health/inspection output when the backend probe
-runs. On the current local M5 Max, the probe artifact
-`prefill-backend-m5-mpp-probe-latest.json` reports Metal 4 ML and MTLTensor
-runtime availability, but `mpp_tensor_ops_symbol_declared=false` and the MPP
-run probe fails because `metal_mpp` is not present in the installed Xcode SDK.
-That means the neural-accelerator prefill path needs a newer SDK/header surface
-before it can honestly become a selectable generation backend; for now only
-`mpsgraph-f32` is selectable as an accelerated prefill backend.
+runs. The earlier probe looked only for `metal_mpp` inside the selected SDK and
+therefore missed the public
+`MetalPerformancePrimitives/MetalPerformancePrimitives.h` system-framework
+entry. After correcting that include/search path on the local M5 Max, both the
+compile probe and the 32x32 execution probe pass with zero maximum absolute
+error. LargerLM now exposes `mpp-f32` as an opt-in backend for resident
+F32/BF16/F16 prefill GEMMs; MPSGraph remains the fallback and routed MXFP4
+experts remain on custom Metal.
+A local synthetic `128x4096` by `4096x4096` F32 comparison measured about
+`7.8 ms` inside MPP versus `17.8 ms` inside MPSGraph. Including the bounded
+matrix read, MPP took about `16.2 ms`, versus `25.3 ms` for MPSGraph and
+`21.7 ms` for the existing custom batch kernel. These are bring-up numbers
+under the current power-limited setup, not a full-model prefill claim.
 Prompt prefill coverage, request health, and benchmark frontier rows also
 report `mpp_tensor_ops_candidate_backend_counts` and
 `mpp_tensor_ops_candidate_backend_flops`: these break down MPP-candidate GEMMs by
@@ -1812,11 +1818,10 @@ Hugging Face weight download.
 A follow-up local-header audit of `artifacts/glm-5.2-mxfp4` with
 `--verify-local-headers --require-complete --require-clean` checked all 76
 shard headers successfully. The companion backend probe report
-`largerlm-prepared/prefill-backend-report-latest.json` has SHA-256
-`d3be34e55ed80db05418a21ca606ea48a3f22c58c05a7601f8694ac7f566f378` and
-records `mpsgraph-f32` as both selectable and validated, while the public SDK
-still leaves the MPP/Neural-Accelerator path at
-`missing_public_mpp_symbols`.
+The superseding
+`largerlm-prepared/prefill-backend-report-mpp-system-header.json` has SHA-256
+`ff4db46d186d87fd04319e5c9e16093f5fcaf41aa9db878d3101a6fdd7a044c2` and
+records both `mpp-f32` and `mpsgraph-f32` as selectable and validated.
 For prompt lengths beyond the existing short smokes, use
 `scripts/long_prompt_readiness_matrix.py` to batch `inspect-prepared` admission
 checks without running generation or reading tensor payloads. The current

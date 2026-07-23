@@ -71,6 +71,37 @@ def test_evaluate_prefill_acceleration_requirement_accepts_forced_mps_matrix() -
     assert gate.accelerated_backends == ("mps-matrix-f32",)
 
 
+def test_evaluate_prefill_acceleration_requirement_accepts_mpp_probe() -> None:
+    gate = evaluate_prefill_acceleration_requirement(
+        configured_backend="mpp-f32",
+        mps_graph_runtime_available=False,
+        mpp_runtime_available=True,
+        mpp_run_probe_requested=True,
+        mpp_run_probe_ran=True,
+        mpp_run_probe_ok=True,
+        selectable_backends=("mpp-f32",),
+        acceleration_runtimes=("mpp_tensor_ops_prefill",),
+    )
+
+    assert gate.ok is True
+    assert gate.reason_code == "ok"
+    assert gate.accelerated_backends == ("mpp-f32",)
+
+
+def test_evaluate_prefill_acceleration_requirement_requires_mpp_probe() -> None:
+    gate = evaluate_prefill_acceleration_requirement(
+        configured_backend="mpp-f32",
+        mps_graph_runtime_available=False,
+        mpp_runtime_available=True,
+        selectable_backends=("mpp-f32",),
+        acceleration_runtimes=("mpp_tensor_ops_prefill",),
+    )
+
+    assert gate.ok is False
+    assert gate.reason_code == "mpp_runtime_probe_required"
+    assert "--run-mpp-probe" in gate.reason
+
+
 def test_evaluate_prefill_acceleration_requirement_reports_mpp_gap() -> None:
     gate = evaluate_prefill_acceleration_requirement(
         configured_backend="auto",
@@ -375,23 +406,19 @@ def test_prefill_backend_recommends_mpp_after_compile_probe(tmp_path: Path) -> N
         "mpp_tensor_ops_prefill",
         "mpsgraph-f32",
     )
-    assert capability.selectable_accelerated_prefill_backends == ("mpsgraph-f32",)
-    assert capability.prefill_acceleration_runtime_gaps == (
-        {
-            "runtime": "mpp_tensor_ops_prefill",
-            "reason": (
-                "MPP tensor ops runtime is visible but no selectable MPP "
-                "prefill execution backend is implemented"
-            ),
-        },
+    assert capability.selectable_accelerated_prefill_backends == (
+        "mpp-f32",
+        "mpsgraph-f32",
     )
+    assert capability.validated_accelerated_prefill_backends == ()
+    assert capability.prefill_acceleration_runtime_gaps == ()
     assert capability.prefill_neural_accelerator_status == {
         "runtime": "mpp_tensor_ops_prefill",
         "execution_path": "mpp_tensor_ops_gpu_neural_accelerator",
-        "status": "runtime_visible_not_selectable",
-        "ready_for_generation": False,
+        "status": "selectable",
+        "ready_for_generation": True,
         "runtime_visible": True,
-        "selectable": False,
+        "selectable": True,
         "metal4_ml_runtime_available": True,
         "mpp_tensor_ops_symbol_declared": True,
         "mpp_compile_probe_requested": True,
@@ -407,10 +434,7 @@ def test_prefill_backend_recommends_mpp_after_compile_probe(tmp_path: Path) -> N
         "mpp_run_probe_dtype": None,
         "mpp_run_probe_execution_path": None,
         "recommended_backend": "mpp_tensor_ops_prefill",
-        "reason": (
-            "MPP tensor ops runtime is visible but generation has no selectable "
-            "MPP prefill backend yet"
-        ),
+        "reason": "MPP tensor ops prefill backend is selectable",
     }
 
 
@@ -457,9 +481,8 @@ def test_prefill_backend_can_run_mpp_probe(tmp_path: Path) -> None:
     assert capability.mpp_run_probe_execution_path == "mpp::tensor_ops::matmul2d"
     assert capability.mpp_runtime_available is True
     assert capability.recommended_backend == "mpp_tensor_ops_prefill"
-    assert capability.prefill_neural_accelerator_status["status"] == (
-        "runtime_executed_not_selectable"
-    )
+    assert capability.prefill_neural_accelerator_status["status"] == "selectable"
+    assert capability.validated_accelerated_prefill_backends == ("mpp-f32",)
     assert capability.prefill_neural_accelerator_status[
         "mpp_run_probe_shape"
     ] == "32x32x32"
@@ -962,7 +985,7 @@ def test_prefill_plan_can_attach_backend_capability(
     ] == "unavailable"
 
 
-def test_prefill_acceleration_helpers_keep_mpp_candidate_unselectable() -> None:
+def test_prefill_acceleration_helpers_expose_mpp_backend() -> None:
     capability = type(
         "Capability",
         (),
@@ -973,18 +996,11 @@ def test_prefill_acceleration_helpers_keep_mpp_candidate_unselectable() -> None:
     )()
 
     assert prefill_acceleration_runtimes(capability) == ("mpp_tensor_ops_prefill",)
-    assert selectable_accelerated_prefill_backends(capability) == ()
+    assert selectable_accelerated_prefill_backends(capability) == ("mpp-f32",)
     assert validated_accelerated_prefill_backends(capability) == ()
-    assert prefill_acceleration_runtime_gaps(capability) == (
-        {
-            "runtime": "mpp_tensor_ops_prefill",
-            "reason": (
-                "MPP tensor ops runtime is visible but no selectable MPP "
-                "prefill execution backend is implemented"
-            ),
-        },
-    )
-    assert prefill_neural_accelerator_status(capability)["status"] == (
-        "runtime_visible_not_selectable"
-    )
-    assert suggested_prefill_acceleration_flags(capability) is None
+    assert prefill_acceleration_runtime_gaps(capability) == ()
+    assert prefill_neural_accelerator_status(capability)["status"] == "selectable"
+    suggestion = suggested_prefill_acceleration_flags(capability)
+    assert suggestion is not None
+    assert suggestion["prefill_linear_backend"] == "mpp-f32"
+    assert suggestion["runtime_probe_argv"] == ("--run-mpp-probe",)

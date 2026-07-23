@@ -93,6 +93,8 @@ static void compile_mpp_probe(id<MTLDevice> device, NSMutableDictionary *payload
         MTLCompileOptions *options = [MTLCompileOptions new];
         options.languageVersion = MTLLanguageVersion4_0;
         NSArray<NSArray<NSString *> *> *variants = @[
+            @[@"MetalPerformancePrimitives.framework",
+              @"#include <metal_stdlib>\n#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n"],
             @[@"metal_stdlib", @"#include <metal_stdlib>\n"],
             @[@"metal_stdlib+metal_tensor",
               @"#include <metal_stdlib>\n#include <metal_tensor>\n"],
@@ -160,6 +162,8 @@ static void run_mpp_probe(id<MTLDevice> device, NSMutableDictionary *payload) {
         MTLCompileOptions *options = [MTLCompileOptions new];
         options.languageVersion = MTLLanguageVersion4_0;
         NSArray<NSArray<NSString *> *> *variants = @[
+            @[@"MetalPerformancePrimitives.framework",
+              @"#include <metal_stdlib>\n#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n"],
             @[@"metal_stdlib+metal_mpp",
               @"#include <metal_stdlib>\n#include <metal_mpp>\n"],
             @[@"metal_stdlib+metal_tensor+metal_mpp",

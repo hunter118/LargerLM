@@ -1482,8 +1482,8 @@ def build_prefill_plan(
     )
     if prefill_linear_backend not in PREFILL_LINEAR_BACKENDS:
         raise PrefillPlanError(
-            "prefill_linear_backend must be custom-metal, mpsgraph-f32, "
-            "mps-matrix-f32, or auto"
+            "prefill_linear_backend must be custom-metal, mpp-f32, "
+            "mpsgraph-f32, mps-matrix-f32, or auto"
         )
     prefill_mpsgraph_min_batch_tokens = _positive_integer_value(
         "prefill_mpsgraph_min_batch_tokens",

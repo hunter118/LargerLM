@@ -3280,6 +3280,8 @@ def _prefill_backend_health(
         )
     except Exception as exc:
         warnings.append(f"prefill backend inspection failed: {exc}")
+        if configured_backend == "mpp-f32":
+            warnings.append("mpp-f32 was forced but MPP TensorOps support was not verified")
         if configured_backend == "mpsgraph-f32":
             warnings.append("mpsgraph-f32 was forced but MPSGraph support was not verified")
         if configured_backend == "auto":
@@ -3400,7 +3402,11 @@ def _prefill_backend_health(
                 warnings.append(
                     "mpsgraph-f32 was forced but MPSGraph runtime was not verified"
                 )
-        elif configured_backend == "auto" and not mpsgraph_runtime_available:
+        elif configured_backend == "mpp-f32" and not backend.mpp_runtime_available:
+            warnings.append(
+                "mpp-f32 was forced but MPP TensorOps runtime was not verified"
+            )
+        elif configured_backend == "auto" and not selectable_accelerated:
             if not backend.mps_graph_matmul_declared:
                 warnings.append(
                     "auto prefill will fall back to custom-metal resident GEMMs because "
@@ -3454,7 +3460,7 @@ def _resolve_server_prefill_linear_backend(
         return "custom-metal"
     return (
         "auto"
-        if _mps_graph_runtime_available_from_backend(backend)
+        if selectable_accelerated_prefill_backends(backend)
         else "custom-metal"
     )
 
@@ -3498,6 +3504,13 @@ def _require_server_prefill_acceleration_backend(
         ),
         mps_graph_probe_ran=getattr(backend, "mps_graph_probe_ran", None),
         mps_graph_probe_ok=getattr(backend, "mps_graph_probe_ok", None),
+        mpp_run_probe_requested=getattr(
+            backend,
+            "mpp_run_probe_requested",
+            None,
+        ),
+        mpp_run_probe_ran=getattr(backend, "mpp_run_probe_ran", None),
+        mpp_run_probe_ok=getattr(backend, "mpp_run_probe_ok", None),
         selectable_backends=selectable_accelerated_prefill_backends(backend),
         acceleration_runtimes=prefill_acceleration_runtimes(backend),
     )
@@ -3524,6 +3537,9 @@ def _prefill_acceleration_requirement_health(
         mps_graph_probe_requested=capability.get("mps_graph_probe_requested"),
         mps_graph_probe_ran=capability.get("mps_graph_probe_ran"),
         mps_graph_probe_ok=capability.get("mps_graph_probe_ok"),
+        mpp_run_probe_requested=capability.get("mpp_run_probe_requested"),
+        mpp_run_probe_ran=capability.get("mpp_run_probe_ran"),
+        mpp_run_probe_ok=capability.get("mpp_run_probe_ok"),
         selectable_backends=tuple(
             capability.get("selectable_accelerated_prefill_backends") or ()
         ),
@@ -3570,12 +3586,12 @@ def _prefill_linear_backend_request_summary(
             "mpsgraph_min_batch_tokens": mpsgraph_min_batch_tokens,
             "mpsgraph_min_matrix_dim": mpsgraph_min_matrix_dim,
         },
-        "mpp_candidate_policy": {
+            "mpp_candidate_policy": {
             "candidate_backend": "mpp_tensor_ops_prefill",
             "execution_path": "mpp_tensor_ops_gpu_neural_accelerator",
             "mpp_tensor_ops_min_batch_tokens": DEFAULT_MPP_MIN_TOKENS,
             "mpp_tensor_ops_min_matrix_dim": MPP_TENSOR_OPS_MIN_MATRIX_DIM,
-            "selectable_prefill_backend": False,
+            "selectable_prefill_backend": effective_backend == "mpp-f32",
         },
     }
     if prompt_chunk_tokens is None or prompt_chunk_tokens <= 0:
@@ -3594,11 +3610,13 @@ def _prefill_linear_backend_request_summary(
         )
 
     matrix_count = 0
+    mpp_count = 0
     mpsgraph_count = 0
     mps_matrix_count = 0
     custom_count = 0
     unsupported_count = 0
     total_estimated_flops = 0
+    mpp_estimated_flops = 0
     mpsgraph_estimated_flops = 0
     mps_matrix_estimated_flops = 0
     custom_estimated_flops = 0
@@ -3723,7 +3741,10 @@ def _prefill_linear_backend_request_summary(
             unsupported_count += 1
             unsupported_estimated_flops += estimated_flops
             continue
-        if resolved_backend == "mpsgraph-f32":
+        if resolved_backend == "mpp-f32":
+            mpp_count += 1
+            mpp_estimated_flops += estimated_flops
+        elif resolved_backend == "mpsgraph-f32":
             mpsgraph_count += 1
             mpsgraph_estimated_flops += estimated_flops
         elif resolved_backend == "mps-matrix-f32":
@@ -3833,15 +3854,19 @@ def _prefill_linear_backend_request_summary(
         {
             "analyzed": True,
             "matrix_count": matrix_count,
-            "accelerated_matrix_count": mpsgraph_count + mps_matrix_count,
+            "accelerated_matrix_count": mpp_count + mpsgraph_count + mps_matrix_count,
+            "mpp_matrix_count": mpp_count,
             "mpsgraph_matrix_count": mpsgraph_count,
             "mps_matrix_matrix_count": mps_matrix_count,
             "custom_metal_matrix_count": custom_count,
             "unsupported_mpsgraph_matrix_count": unsupported_count,
             "total_estimated_flops": total_estimated_flops,
             "accelerated_estimated_flops": (
-                mpsgraph_estimated_flops + mps_matrix_estimated_flops
+                mpp_estimated_flops
+                + mpsgraph_estimated_flops
+                + mps_matrix_estimated_flops
             ),
+            "mpp_estimated_flops": mpp_estimated_flops,
             "mpsgraph_estimated_flops": mpsgraph_estimated_flops,
             "mps_matrix_estimated_flops": mps_matrix_estimated_flops,
             "custom_metal_estimated_flops": custom_estimated_flops,
@@ -3910,6 +3935,7 @@ def _prefill_acceleration_coverage_summary(
 ) -> dict[str, Any]:
     analyzed = bool(linear_summary.get("analyzed"))
     matrix_count = int(linear_summary.get("matrix_count") or 0)
+    mpp_count = int(linear_summary.get("mpp_matrix_count") or 0)
     mpsgraph_count = int(linear_summary.get("mpsgraph_matrix_count") or 0)
     mps_matrix_count = int(linear_summary.get("mps_matrix_matrix_count") or 0)
     custom_count = int(linear_summary.get("custom_metal_matrix_count") or 0)
@@ -4010,7 +4036,7 @@ def _prefill_acceleration_coverage_summary(
     accelerated_count = int(
         linear_summary.get(
             "accelerated_matrix_count",
-            mpsgraph_count + mps_matrix_count,
+            mpp_count + mpsgraph_count + mps_matrix_count,
         )
         or 0
     )
@@ -4093,9 +4119,13 @@ def _prefill_acceleration_coverage_summary(
         backend
         for backend in PREFILL_LINEAR_ACCELERATED_BACKENDS
         if (
-            mpsgraph_count
-            if backend == "mpsgraph-f32"
-            else mps_matrix_count
+            mpp_count
+            if backend == "mpp-f32"
+            else (
+                mpsgraph_count
+                if backend == "mpsgraph-f32"
+                else mps_matrix_count
+            )
         )
         > 0
     )
@@ -7101,13 +7131,14 @@ class PreparedGenerationApp:
             raise PreparedServerError("metal_binary_path must be a path") from exc
         if config.prefill_linear_backend not in {
             "custom-metal",
+            "mpp-f32",
             "mpsgraph-f32",
             "mps-matrix-f32",
             "auto",
         }:
             raise PreparedServerError(
-                "prefill_linear_backend must be custom-metal, mpsgraph-f32, "
-                "mps-matrix-f32, or auto"
+                "prefill_linear_backend must be custom-metal, mpp-f32, "
+                "mpsgraph-f32, mps-matrix-f32, or auto"
             )
         if type(config.require_prefill_acceleration) is not bool:
             raise PreparedServerError("require_prefill_acceleration must be a boolean")

@@ -1835,26 +1835,21 @@ def test_prepared_server_backend_health_reports_selectable_acceleration(
         "mpp_tensor_ops_prefill",
         "mpsgraph-f32",
     )
-    assert capability["selectable_accelerated_prefill_backends"] == ("mpsgraph-f32",)
-    assert capability["validated_accelerated_prefill_backends"] == ("mpsgraph-f32",)
-    assert capability["prefill_acceleration_runtime_gaps"] == (
-        {
-            "runtime": "mpp_tensor_ops_prefill",
-            "reason": (
-                "MPP tensor ops runtime is visible but no selectable MPP "
-                "prefill execution backend is implemented"
-            ),
-        },
+    assert capability["selectable_accelerated_prefill_backends"] == (
+        "mpp-f32",
+        "mpsgraph-f32",
     )
+    assert capability["validated_accelerated_prefill_backends"] == ("mpsgraph-f32",)
+    assert capability["prefill_acceleration_runtime_gaps"] == ()
     neural_status = capability["prefill_neural_accelerator_status"]
     assert neural_status["runtime"] == "mpp_tensor_ops_prefill"
     assert neural_status["execution_path"] == (
         "mpp_tensor_ops_gpu_neural_accelerator"
     )
-    assert neural_status["status"] == "runtime_visible_not_selectable"
+    assert neural_status["status"] == "selectable"
     assert neural_status["runtime_visible"] is True
-    assert neural_status["ready_for_generation"] is False
-    assert neural_status["selectable"] is False
+    assert neural_status["ready_for_generation"] is True
+    assert neural_status["selectable"] is True
     assert capability["selectable_prefill_acceleration_available"] is True
     assert capability["validated_prefill_acceleration_available"] is True
     assert capability["suggested_prefill_acceleration_flags"] == {
@@ -1864,17 +1859,9 @@ def test_prepared_server_backend_health_reports_selectable_acceleration(
             "mpp_tensor_ops_prefill",
             "mpsgraph-f32",
         ),
-        "selectable_accelerated_prefill_backends": ("mpsgraph-f32",),
+        "selectable_accelerated_prefill_backends": ("mpp-f32", "mpsgraph-f32"),
         "validated_accelerated_prefill_backends": ("mpsgraph-f32",),
-        "prefill_acceleration_runtime_gaps": (
-            {
-                "runtime": "mpp_tensor_ops_prefill",
-                "reason": (
-                    "MPP tensor ops runtime is visible but no selectable MPP "
-                    "prefill execution backend is implemented"
-                ),
-            },
-        ),
+        "prefill_acceleration_runtime_gaps": (),
         "prefill_neural_accelerator_status": neural_status,
         "runtime_probe_backend": "mpsgraph-f32",
         "runtime_probe_required": True,
@@ -1902,17 +1889,9 @@ def test_prepared_server_backend_health_reports_selectable_acceleration(
             "mpp_tensor_ops_prefill",
             "mpsgraph-f32",
         ),
-        "selectable_accelerated_prefill_backends": ("mpsgraph-f32",),
+        "selectable_accelerated_prefill_backends": ("mpp-f32", "mpsgraph-f32"),
         "validated_accelerated_prefill_backends": ("mpsgraph-f32",),
-        "prefill_acceleration_runtime_gaps": (
-            {
-                "runtime": "mpp_tensor_ops_prefill",
-                "reason": (
-                    "MPP tensor ops runtime is visible but no selectable MPP "
-                    "prefill execution backend is implemented"
-                ),
-            },
-        ),
+        "prefill_acceleration_runtime_gaps": (),
         "prefill_neural_accelerator_status": neural_status,
         "runtime_probe_backend": "mpsgraph-f32",
         "runtime_probe_required": True,
@@ -1992,7 +1971,7 @@ def test_prepared_server_backend_health_runs_mpp_compile_probe_when_requested(
     assert capability["mpp_compile_probe_ok"] is True
     assert capability["mpp_compile_variant"] == "metal_mpp"
     neural_status = capability["prefill_neural_accelerator_status"]
-    assert neural_status["status"] == "runtime_visible_not_selectable"
+    assert neural_status["status"] == "selectable"
     assert neural_status["mpp_tensor_ops_symbol_declared"] is True
     assert neural_status["mpp_compile_probe_requested"] is True
     assert neural_status["mpp_compile_probe_ran"] is True
@@ -2057,9 +2036,7 @@ def test_prepared_server_backend_health_runs_mpp_execution_probe_when_requested(
     assert capability["mpp_run_probe_ran"] is True
     assert capability["mpp_run_probe_ok"] is True
     assert capability["mpp_run_probe_max_abs_error"] == 0.0
-    assert capability["prefill_neural_accelerator_status"]["status"] == (
-        "runtime_executed_not_selectable"
-    )
+    assert capability["prefill_neural_accelerator_status"]["status"] == "selectable"
     probe_flags = health["suggested_prefill_backend_probe_flags"]
     assert probe_flags == {
         "source": "prepared_health",

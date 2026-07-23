@@ -13,6 +13,18 @@ class PrefillBackendError(RuntimeError):
 
 
 DEFAULT_PREFILL_BACKEND_PROBE_TIMEOUT_SECONDS = 5.0
+SYSTEM_MPP_HEADERS = (
+    Path(
+        "/System/Library/Frameworks/"
+        "MetalPerformancePrimitives.framework/Headers/"
+        "MetalPerformancePrimitives.h"
+    ),
+    Path(
+        "/System/Library/Frameworks/"
+        "MetalPerformancePrimitives.framework/Headers/"
+        "MPPTensorOpsMatMul2d.h"
+    ),
+)
 
 
 def default_prefill_backend_probe_path() -> Path:
@@ -152,6 +164,9 @@ class PrefillAccelerationRequirement:
     mps_graph_probe_ran: bool | None
     mps_graph_probe_ok: bool | None
     mpp_runtime_available: bool | None
+    mpp_run_probe_requested: bool | None
+    mpp_run_probe_ran: bool | None
+    mpp_run_probe_ok: bool | None
     prefill_acceleration_runtimes: tuple[str, ...]
     accelerated_backends: tuple[str, ...]
     reason: str
@@ -183,6 +198,8 @@ def selectable_accelerated_prefill_backends(capability: object) -> tuple[str, ..
     """Return accelerated backends that current LargerLM commands can select."""
 
     backends: list[str] = []
+    if _bool_capability_attr(capability, "mpp_runtime_available"):
+        backends.append("mpp-f32")
     if _bool_capability_attr(capability, "mps_graph_runtime_available"):
         backends.append("mpsgraph-f32")
     return tuple(backends)
@@ -196,12 +213,25 @@ def _mps_graph_runtime_probe_passed(capability: object) -> bool:
     )
 
 
+def _mpp_runtime_probe_passed(capability: object) -> bool:
+    return (
+        getattr(capability, "mpp_run_probe_requested", None) is True
+        and getattr(capability, "mpp_run_probe_ran", None) is True
+        and getattr(capability, "mpp_run_probe_ok", None) is True
+    )
+
+
 def validated_accelerated_prefill_backends(
     capability: object,
 ) -> tuple[str, ...]:
     """Return selectable accelerated backends with runtime proof for hard gates."""
 
     backends: list[str] = []
+    if (
+        "mpp-f32" in selectable_accelerated_prefill_backends(capability)
+        and _mpp_runtime_probe_passed(capability)
+    ):
+        backends.append("mpp-f32")
     if (
         "mpsgraph-f32" in selectable_accelerated_prefill_backends(capability)
         and _mps_graph_runtime_probe_passed(capability)
@@ -219,14 +249,14 @@ def prefill_acceleration_runtime_gaps(
     gaps: list[dict[str, str]] = []
     if (
         "mpp_tensor_ops_prefill" in prefill_acceleration_runtimes(capability)
-        and "mpp_tensor_ops_prefill" not in selectable
+        and "mpp-f32" not in selectable
     ):
         gaps.append(
             {
                 "runtime": "mpp_tensor_ops_prefill",
                 "reason": (
-                    "MPP tensor ops runtime is visible but no selectable MPP "
-                    "prefill execution backend is implemented"
+                    "MPP tensor ops runtime is visible but the mpp-f32 prefill "
+                    "execution backend is not selectable"
                 ),
             }
         )
@@ -236,9 +266,8 @@ def prefill_acceleration_runtime_gaps(
 def prefill_neural_accelerator_status(capability: object) -> dict[str, object]:
     """Return the current MPP/Metal ML prefill readiness boundary.
 
-    The MPP tensor-op path is the planned GPU neural-accelerator route for large
-    prefill GEMMs. Keep it separate from selectable generation backends until a
-    real execution backend is wired.
+    The MPP tensor-op path is the GPU neural-accelerator route for large resident
+    prefill GEMMs. Quantized routed experts remain on the custom MXFP4 kernels.
     """
 
     mpp_runtime = _bool_capability_attr(capability, "mpp_runtime_available")
@@ -259,7 +288,7 @@ def prefill_neural_accelerator_status(capability: object) -> dict[str, object]:
     run_ran = bool(getattr(capability, "mpp_run_probe_ran", False))
     run_ok = getattr(capability, "mpp_run_probe_ok", None) is True
     selectable = (
-        "mpp_tensor_ops_prefill" in selectable_accelerated_prefill_backends(capability)
+        "mpp-f32" in selectable_accelerated_prefill_backends(capability)
     )
     if selectable:
         status = "selectable"
@@ -275,16 +304,10 @@ def prefill_neural_accelerator_status(capability: object) -> dict[str, object]:
         reason = "MPP tensor ops run probe failed"
     elif mpp_runtime and run_ok:
         status = "runtime_executed_not_selectable"
-        reason = (
-            "MPP tensor ops runtime executed a tiny matmul but generation has "
-            "no selectable MPP prefill backend yet"
-        )
+        reason = "MPP tensor ops runtime executed but mpp-f32 is not selectable"
     elif mpp_runtime:
         status = "runtime_visible_not_selectable"
-        reason = (
-            "MPP tensor ops runtime is visible but generation has no selectable "
-            "MPP prefill backend yet"
-        )
+        reason = "MPP tensor ops runtime is visible but mpp-f32 is not selectable"
     elif mpp_symbols and metal4_ml and not compile_requested:
         status = "compile_probe_required"
         reason = "MPP symbols and Metal 4 ML runtime are visible; compile probe not run"
@@ -347,11 +370,15 @@ def suggested_prefill_acceleration_flags(
     selectable = selectable_accelerated_prefill_backends(capability)
     if not selectable:
         return None
-    backend = selectable[0]
+    validated = validated_accelerated_prefill_backends(capability)
+    backend = validated[0] if validated else selectable[0]
     runtime_probe_argv: tuple[str, ...] = ()
-    runtime_probe_required = backend == "mpsgraph-f32"
+    runtime_probe_required = backend in {"mpp-f32", "mpsgraph-f32"}
     runtime_probe_satisfied = False
-    if runtime_probe_required:
+    if backend == "mpp-f32":
+        runtime_probe_argv = ("--run-mpp-probe",)
+        runtime_probe_satisfied = _mpp_runtime_probe_passed(capability)
+    elif backend == "mpsgraph-f32":
         runtime_probe_argv = ("--run-mpsgraph-probe",)
         runtime_probe_satisfied = (
             getattr(capability, "mps_graph_probe_requested", False) is True
@@ -364,7 +391,7 @@ def suggested_prefill_acceleration_flags(
         "prefill_acceleration_runtimes": prefill_acceleration_runtimes(capability),
         "selectable_accelerated_prefill_backends": selectable,
         "validated_accelerated_prefill_backends": (
-            validated_accelerated_prefill_backends(capability)
+            validated
         ),
         "prefill_acceleration_runtime_gaps": (
             prefill_acceleration_runtime_gaps(capability)
@@ -393,6 +420,9 @@ def evaluate_prefill_acceleration_requirement(
     mps_graph_probe_requested: bool | None = None,
     mps_graph_probe_ran: bool | None = None,
     mps_graph_probe_ok: bool | None = None,
+    mpp_run_probe_requested: bool | None = None,
+    mpp_run_probe_ran: bool | None = None,
+    mpp_run_probe_ok: bool | None = None,
     selectable_backends: tuple[str, ...] = (),
     acceleration_runtimes: tuple[str, ...] = (),
 ) -> PrefillAccelerationRequirement:
@@ -402,6 +432,11 @@ def evaluate_prefill_acceleration_requirement(
         mps_graph_probe_requested is True
         and mps_graph_probe_ran is True
         and mps_graph_probe_ok is True
+    )
+    mpp_probe_passed = (
+        mpp_run_probe_requested is True
+        and mpp_run_probe_ran is True
+        and mpp_run_probe_ok is True
     )
     if configured_backend == "custom-metal":
         ok = False
@@ -423,6 +458,22 @@ def evaluate_prefill_acceleration_requirement(
             ok = True
             reason = ""
             reason_code = "ok"
+    elif configured_backend == "mpp-f32":
+        if (
+            mpp_runtime_available is not True
+            or "mpp-f32" not in accelerated
+        ):
+            ok = False
+            reason = "mpp-f32 was configured but MPP tensor ops runtime is unavailable"
+            reason_code = "mpp_runtime_unavailable"
+        elif not mpp_probe_passed:
+            ok = False
+            reason = "mpp-f32 requires --run-mpp-probe and a passing runtime probe"
+            reason_code = "mpp_runtime_probe_required"
+        else:
+            ok = True
+            reason = ""
+            reason_code = "ok"
     elif configured_backend == "mps-matrix-f32":
         ok = True
         reason = ""
@@ -431,16 +482,29 @@ def evaluate_prefill_acceleration_requirement(
             accelerated = (*accelerated, "mps-matrix-f32")
     else:
         ok = bool(accelerated)
-        if ok and "mpsgraph-f32" in accelerated and not mpsgraph_probe_passed:
+        if ok and "mpp-f32" in accelerated and mpp_probe_passed:
+            reason = ""
+            reason_code = "ok"
+        elif ok and "mpsgraph-f32" in accelerated and mpsgraph_probe_passed:
+            reason = ""
+            reason_code = "ok"
+        elif ok and "mps-matrix-f32" in accelerated:
+            reason = ""
+            reason_code = "ok"
+        elif ok and "mpp-f32" in accelerated:
+            ok = False
+            reason = (
+                "selectable mpp-f32 requires --run-mpp-probe and a passing "
+                "runtime probe"
+            )
+            reason_code = "selectable_mpp_runtime_probe_required"
+        elif ok and "mpsgraph-f32" in accelerated:
             ok = False
             reason = (
                 "selectable mpsgraph-f32 requires --run-mpsgraph-probe and a "
                 "passing runtime probe"
             )
             reason_code = "selectable_mpsgraph_runtime_probe_required"
-        elif ok:
-            reason = ""
-            reason_code = "ok"
         elif mpp_runtime_available is True:
             reason = (
                 "MPP tensor ops runtime is visible but no selectable MPP "
@@ -459,6 +523,9 @@ def evaluate_prefill_acceleration_requirement(
         mps_graph_probe_ran=mps_graph_probe_ran,
         mps_graph_probe_ok=mps_graph_probe_ok,
         mpp_runtime_available=mpp_runtime_available,
+        mpp_run_probe_requested=mpp_run_probe_requested,
+        mpp_run_probe_ran=mpp_run_probe_ran,
+        mpp_run_probe_ok=mpp_run_probe_ok,
         prefill_acceleration_runtimes=runtimes,
         accelerated_backends=accelerated,
         reason=reason,
@@ -637,7 +704,8 @@ def inspect_prefill_backend(
         raise PrefillBackendError("run_mpsgraph_probe requires run_host_probe")
     compile_mpp_probe = bool(compile_mpp_probe or run_mpp_probe)
 
-    sdk = Path(sdk_path) if sdk_path is not None else find_macos_sdk_path()
+    explicit_sdk = sdk_path is not None
+    sdk = Path(sdk_path) if explicit_sdk else find_macos_sdk_path()
     if sdk is not None and not sdk.exists():
         raise PrefillBackendError(f"SDK path does not exist: {sdk}")
 
@@ -688,6 +756,8 @@ def inspect_prefill_backend(
         device_h,
         mps_matmul_h,
     ]
+    if not explicit_sdk:
+        search_paths.extend(SYSTEM_MPP_HEADERS)
     mpp_tensor_ops_symbol_declared = _contains_any(
         search_paths,
         ("mpp::tensor_ops", "namespace mpp", "tensor_ops"),
@@ -731,7 +801,7 @@ def inspect_prefill_backend(
     if metal4_headers_available and not metal4_machine_learning_declared:
         reasons.append("Metal 4 machine-learning API symbols are not declared")
     if not mpp_tensor_ops_symbol_declared:
-        reasons.append("mpp::tensor_ops symbols were not found in public SDK headers")
+        reasons.append("mpp::tensor_ops symbols were not found in public Metal/MPP headers")
     if run_host_probe and not host_probe_ran:
         detail = f": {host_probe_error}" if host_probe_error else ""
         reasons.append(f"host probe was not run successfully: {probe_path}{detail}")

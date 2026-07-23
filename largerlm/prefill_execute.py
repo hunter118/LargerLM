@@ -46,9 +46,23 @@ class PrefillExecuteError(RuntimeError):
     """Raised when a bounded prefill primitive cannot be executed safely."""
 
 
-PREFILL_LINEAR_BACKENDS = {"custom-metal", "mpsgraph-f32", "mps-matrix-f32", "auto"}
-PREFILL_LINEAR_ACCELERATED_BACKENDS = ("mpsgraph-f32", "mps-matrix-f32")
-PREFILL_LINEAR_F32_CONVERSION_BACKENDS = {"mpsgraph-f32", "mps-matrix-f32"}
+PREFILL_LINEAR_BACKENDS = {
+    "custom-metal",
+    "mpp-f32",
+    "mpsgraph-f32",
+    "mps-matrix-f32",
+    "auto",
+}
+PREFILL_LINEAR_ACCELERATED_BACKENDS = (
+    "mpp-f32",
+    "mpsgraph-f32",
+    "mps-matrix-f32",
+)
+PREFILL_LINEAR_F32_CONVERSION_BACKENDS = {
+    "mpp-f32",
+    "mpsgraph-f32",
+    "mps-matrix-f32",
+}
 BATCH_FUSED_ATTN_PROJECTIONS_DISABLE_ENV = (
     "LARGERLM_DISABLE_BATCH_FUSED_ATTN_PROJECTIONS"
 )
@@ -154,8 +168,8 @@ def _resolve_prefill_linear_backend(
 ) -> str:
     if requested not in PREFILL_LINEAR_BACKENDS:
         raise PrefillExecuteError(
-            "prefill_linear_backend must be custom-metal, mpsgraph-f32, "
-            "mps-matrix-f32, or auto"
+            "prefill_linear_backend must be custom-metal, mpp-f32, "
+            "mpsgraph-f32, mps-matrix-f32, or auto"
         )
     if type(mpsgraph_min_batch_tokens) is not int or mpsgraph_min_batch_tokens <= 0:
         raise PrefillExecuteError("prefill_mpsgraph_min_batch_tokens must be positive")

@@ -664,7 +664,7 @@ any large model work. MPP compile probes require that host probe and report
 is requested, `mpp_runtime_available` requires that tiny execution probe to
 pass. `metal/largerlm-runner --self-test-mpp` runs the same tiny MPP matmul
 inside the inference runner binary as an additional executable-boundary check,
-without loading weights or making MPP selectable for generation. A separate
+without loading weights. A separate
 opt-in MPSGraph runtime probe runs only a 2x2 float32 matmul and records
 `mps_graph_probe_*` fields; when requested, `mps_graph_runtime_available`
 requires that tiny matmul to succeed. Prepared commands use a configurable
@@ -685,19 +685,21 @@ for diagnosis.
 from a runtime that passed the host probe; prepared serving uses that runtime
 field for `auto` backend admission. The same report also separates
 `prefill_acceleration_runtimes` from
-`selectable_accelerated_prefill_backends`: MPP can appear as a probed
-acceleration runtime before LargerLM has a command-line/backend path that can
-select it for generation, while MPSGraph is the current selectable accelerated
-resident GEMM backend. `suggested_prefill_acceleration_flags` converts only the
-selectable backend set into argv-style launch flags, currently
-`--prefill-linear-backend mpsgraph-f32 --require-prefill-acceleration
---run-mpsgraph-probe`, and reports whether that runtime probe has already
-passed.
+`selectable_accelerated_prefill_backends`. MPP appears as the selectable
+`mpp-f32` backend after its compile probe succeeds; hard acceleration gates
+additionally require the execution probe. MPSGraph remains the portable
+accelerated fallback. `suggested_prefill_acceleration_flags` prefers a validated
+backend and emits either `--prefill-linear-backend mpp-f32
+--require-prefill-acceleration --run-mpp-probe` or the equivalent MPSGraph
+flags.
 `validated_accelerated_prefill_backends` is the hard-gate subset of the
-selectable set: today `mpsgraph-f32` enters it only when the runtime probe was
-requested, ran, and passed. Launch-audit consumers use this field to reject
-artifacts that advertise selectable acceleration without preserving runtime
-proof.
+selectable set: `mpp-f32` and `mpsgraph-f32` enter it only when their respective
+runtime probes were requested, ran, and passed. Launch-audit consumers use this
+field to reject artifacts that advertise selectable acceleration without
+preserving runtime proof. The current `mpp-f32` implementation converts
+resident F32/BF16/F16 matrices into a bounded F32 working buffer and dispatches
+32x32 MPP TensorOps tiles. Quantized routed experts continue to use the existing
+MXFP4 kernels.
 `prefill_neural_accelerator_status` summarizes the same MPP/Metal-ML path as a
 machine-readable bring-up state: runtime-visible, selectable, compile/run-probe
 status, planned `mpp_tensor_ops_gpu_neural_accelerator` execution path, and the

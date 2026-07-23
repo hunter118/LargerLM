@@ -69,7 +69,7 @@ static void usage(const char *argv0) {
             "--tensor-suffix SUFFIX --input-f32 PATH --batch-tokens N "
             "[--output-f32 PATH] [--max-resident-matrix-mib N] "
             "[--max-runner-scratch-mib N] "
-            "[--prefill-linear-backend custom-metal|mpsgraph-f32|mps-matrix-f32]\n"
+            "[--prefill-linear-backend custom-metal|mpp-f32|mpsgraph-f32|mps-matrix-f32]\n"
             "       %s --resident-layout PATH --layer N --run-shared-expert-batch "
             "--input-f32 PATH --batch-tokens N [--output-f32 PATH] "
             "[--max-resident-matrix-mib N] [--max-runner-scratch-mib N]\n"
@@ -4144,6 +4144,8 @@ static int run_mpp_self_test(void) {
         MTLCompileOptions *options = [MTLCompileOptions new];
         options.languageVersion = MTLLanguageVersion4_0;
         NSArray<NSArray<NSString *> *> *variants = @[
+            @[@"MetalPerformancePrimitives.framework",
+              @"#include <metal_stdlib>\n#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n"],
             @[@"metal_stdlib+metal_mpp",
               @"#include <metal_stdlib>\n#include <metal_mpp>\n"],
             @[@"metal_stdlib+metal_tensor+metal_mpp",
@@ -8680,6 +8682,196 @@ static int run_resident_matrix_batch_linear_mpsgraph_f32(id<MTLDevice> device,
     return 1;
 }
 
+static id<MTLComputePipelineState> resident_mpp_batch_linear_pipeline(
+    id<MTLDevice> device
+) {
+    static id<MTLDevice> cached_device = nil;
+    static id<MTLComputePipelineState> cached_pipeline = nil;
+    @synchronized(device) {
+        if (cached_pipeline && cached_device == device) {
+            return cached_pipeline;
+        }
+        if (!@available(macOS 26.0, *)) {
+            fprintf(stderr, "mpp-f32 backend requires macOS 26.0 or newer\n");
+            return nil;
+        }
+        NSString *source =
+            @"#include <metal_stdlib>\n"
+             "#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n"
+             "using namespace metal;\n"
+             "using namespace mpp::tensor_ops;\n"
+             "kernel void largerlm_mpp_batch_linear_f32(\n"
+             "    device float *input [[buffer(0)]],\n"
+             "    device float *weight [[buffer(1)]],\n"
+             "    device float *output [[buffer(2)]],\n"
+             "    constant uint& m [[buffer(3)]],\n"
+             "    constant uint& n [[buffer(4)]],\n"
+             "    constant uint& k [[buffer(5)]],\n"
+             "    uint2 tgid [[threadgroup_position_in_grid]]) {\n"
+             "    constexpr auto desc = matmul2d_descriptor(\n"
+             "        32, 32, static_cast<int>(dynamic_extent), false, true, false);\n"
+             "    matmul2d<desc, execution_simdgroup> op;\n"
+             "    auto a = tensor(input,\n"
+             "        dextents<int, 2>{static_cast<int>(k), static_cast<int>(m)},\n"
+             "        array<int, 2>{1, static_cast<int>(k)});\n"
+             "    auto b = tensor(weight,\n"
+             "        dextents<int, 2>{static_cast<int>(k), static_cast<int>(n)},\n"
+             "        array<int, 2>{1, static_cast<int>(k)});\n"
+             "    auto d = tensor(output,\n"
+             "        dextents<int, 2>{static_cast<int>(n), static_cast<int>(m)},\n"
+             "        array<int, 2>{1, static_cast<int>(n)});\n"
+             "    auto tile_a = a.slice(0, static_cast<int>(tgid.y) * 32);\n"
+             "    auto tile_b = b.slice(0, static_cast<int>(tgid.x) * 32);\n"
+             "    auto tile_d = d.slice(static_cast<int>(tgid.x) * 32,\n"
+             "                          static_cast<int>(tgid.y) * 32);\n"
+             "    op.run(tile_a, tile_b, tile_d);\n"
+             "}\n";
+        MTLCompileOptions *options = [MTLCompileOptions new];
+        options.languageVersion = MTLLanguageVersion4_0;
+        NSError *library_error = nil;
+        id<MTLLibrary> library = [device newLibraryWithSource:source
+                                                      options:options
+                                                        error:&library_error];
+        if (!library) {
+            fprintf(stderr,
+                    "failed to compile MPP batch-linear library: %s\n",
+                    library_error.localizedDescription.UTF8String);
+            return nil;
+        }
+        id<MTLFunction> function =
+            [library newFunctionWithName:@"largerlm_mpp_batch_linear_f32"];
+        if (!function) {
+            fprintf(stderr, "MPP batch-linear function was not found\n");
+            return nil;
+        }
+        NSError *pipeline_error = nil;
+        id<MTLComputePipelineState> pipeline =
+            [device newComputePipelineStateWithFunction:function error:&pipeline_error];
+        if (!pipeline) {
+            fprintf(stderr,
+                    "failed to create MPP batch-linear pipeline: %s\n",
+                    pipeline_error.localizedDescription.UTF8String);
+            return nil;
+        }
+        cached_device = device;
+        cached_pipeline = pipeline;
+        return cached_pipeline;
+    }
+}
+
+static int run_resident_matrix_batch_linear_mpp_f32(
+    id<MTLDevice> device,
+    id<MTLCommandQueue> queue,
+    NSString *weight_path,
+    ResidentMatrixInfo matrix,
+    id<MTLBuffer> input,
+    id<MTLBuffer> output,
+    uint32_t batch_tokens,
+    double *matrix_f32_elapsed_seconds,
+    double *mpp_elapsed_seconds
+) {
+    if (matrix_f32_elapsed_seconds) *matrix_f32_elapsed_seconds = 0.0;
+    if (mpp_elapsed_seconds) *mpp_elapsed_seconds = 0.0;
+    int dtype_ok = (
+        strcmp(matrix.dtype, "F32") == 0 ||
+        strcmp(matrix.dtype, "float32") == 0 ||
+        strcmp(matrix.dtype, "FLOAT32") == 0 ||
+        strcmp(matrix.dtype, "BF16") == 0 ||
+        strcmp(matrix.dtype, "bfloat16") == 0 ||
+        strcmp(matrix.dtype, "BFLOAT16") == 0 ||
+        strcmp(matrix.dtype, "F16") == 0 ||
+        strcmp(matrix.dtype, "float16") == 0 ||
+        strcmp(matrix.dtype, "FLOAT16") == 0
+    );
+    if (!dtype_ok) {
+        fprintf(stderr,
+                "mpp-f32 backend supports F32/BF16/F16 resident matrices, got %s for %s\n",
+                matrix.dtype,
+                matrix.name);
+        return 0;
+    }
+
+    CFAbsoluteTime matrix_f32_started = CFAbsoluteTimeGetCurrent();
+    uint64_t matrix_f32_bytes =
+        (uint64_t)matrix.out_dim * matrix.in_dim * sizeof(float);
+    uint64_t alloc_size = align_up_u64(matrix_f32_bytes, 2 * 1024 * 1024);
+    void *aligned = NULL;
+    if (posix_memalign(&aligned, 2 * 1024 * 1024, (size_t)alloc_size) != 0) {
+        fprintf(stderr, "posix_memalign failed for MPP matrix %s\n", matrix.name);
+        return 0;
+    }
+    memset(aligned, 0, (size_t)alloc_size);
+    if (!read_resident_matrix_f32_into(weight_path,
+                                       matrix,
+                                       matrix.out_dim,
+                                       matrix.in_dim,
+                                       (float *)aligned,
+                                       alloc_size)) {
+        free(aligned);
+        return 0;
+    }
+    id<MTLBuffer> bMatrix =
+        [device newBufferWithBytesNoCopy:aligned
+                                   length:(NSUInteger)alloc_size
+                                  options:MTLResourceStorageModeShared
+                              deallocator:^(void *pointer, NSUInteger length) {
+                                  (void)length;
+                                  free(pointer);
+                              }];
+    if (!bMatrix) {
+        fprintf(stderr, "failed to wrap MPP matrix %s as Metal buffer\n", matrix.name);
+        free(aligned);
+        return 0;
+    }
+    if (matrix_f32_elapsed_seconds) {
+        *matrix_f32_elapsed_seconds = CFAbsoluteTimeGetCurrent() - matrix_f32_started;
+    }
+
+    CFAbsoluteTime mpp_started = CFAbsoluteTimeGetCurrent();
+    id<MTLComputePipelineState> pipeline =
+        resident_mpp_batch_linear_pipeline(device);
+    if (!pipeline) return 0;
+    uint64_t output_bytes =
+        (uint64_t)batch_tokens * matrix.out_dim * sizeof(float);
+    memset(output.contents, 0, (size_t)output_bytes);
+    id<MTLCommandBuffer> cmd = [queue commandBuffer];
+    if (!cmd) {
+        fprintf(stderr, "failed to create MPP batch-linear command buffer for %s\n",
+                matrix.name);
+        return 0;
+    }
+    id<MTLComputeCommandEncoder> enc =
+        checked_compute_encoder(cmd, "MPP resident batch linear");
+    if (!enc) return 0;
+    [enc setComputePipelineState:pipeline];
+    [enc setBuffer:input offset:0 atIndex:0];
+    [enc setBuffer:bMatrix offset:0 atIndex:1];
+    [enc setBuffer:output offset:0 atIndex:2];
+    uint32_t m = batch_tokens;
+    uint32_t n = matrix.out_dim;
+    uint32_t k = matrix.in_dim;
+    [enc setBytes:&m length:sizeof(m) atIndex:3];
+    [enc setBytes:&n length:sizeof(n) atIndex:4];
+    [enc setBytes:&k length:sizeof(k) atIndex:5];
+    MTLSize groups = MTLSizeMake((n + 31u) / 32u, (m + 31u) / 32u, 1);
+    [enc dispatchThreadgroups:groups
+        threadsPerThreadgroup:MTLSizeMake(pipeline.threadExecutionWidth, 1, 1)];
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    if (cmd.status == MTLCommandBufferStatusError) {
+        fprintf(stderr,
+                "MPP resident batch linear failed for %s: %s\n",
+                matrix.name,
+                cmd.error.localizedDescription.UTF8String);
+        return 0;
+    }
+    if (mpp_elapsed_seconds) {
+        *mpp_elapsed_seconds = CFAbsoluteTimeGetCurrent() - mpp_started;
+    }
+    return 1;
+}
+
 static int run_resident_matrix_batch_linear_mps_matrix_f32(id<MTLDevice> device,
                                                            id<MTLCommandQueue> queue,
                                                            NSString *weight_path,
@@ -9190,11 +9382,13 @@ static int run_resident_linear_batch(id<MTLDevice> device,
                                      NSString *backend) {
     if (!backend) backend = @"custom-metal";
     int use_custom_metal = [backend isEqualToString:@"custom-metal"];
+    int use_mpp_f32 = [backend isEqualToString:@"mpp-f32"];
     int use_mpsgraph_f32 = [backend isEqualToString:@"mpsgraph-f32"];
     int use_mps_matrix_f32 = [backend isEqualToString:@"mps-matrix-f32"];
-    if (!use_custom_metal && !use_mpsgraph_f32 && !use_mps_matrix_f32) {
+    if (!use_custom_metal && !use_mpp_f32 &&
+        !use_mpsgraph_f32 && !use_mps_matrix_f32) {
         fprintf(stderr,
-                "unsupported --prefill-linear-backend %s; expected custom-metal, mpsgraph-f32, or mps-matrix-f32\n",
+                "unsupported --prefill-linear-backend %s; expected custom-metal, mpp-f32, mpsgraph-f32, or mps-matrix-f32\n",
                 backend.UTF8String);
         return 1;
     }
@@ -9291,7 +9485,7 @@ static int run_resident_linear_batch(id<MTLDevice> device,
     uint64_t matrix_scratch_bytes = align_up_u64(matrix_bytes, 2 * 1024 * 1024);
     uint64_t matrix_f32_bytes = 0;
     uint64_t matrix_raw_conversion_bytes = 0;
-    if (use_mpsgraph_f32 || use_mps_matrix_f32) {
+    if (use_mpp_f32 || use_mpsgraph_f32 || use_mps_matrix_f32) {
         uint64_t matrix_row_f32_bytes = (uint64_t)in_dim * sizeof(float);
         if (matrix_row_f32_bytes == 0 ||
             (uint64_t)out_dim > UINT64_MAX / matrix_row_f32_bytes) {
@@ -9349,7 +9543,15 @@ static int run_resident_linear_batch(id<MTLDevice> device,
     double matrix_f32_elapsed = 0.0;
     double accelerator_elapsed = 0.0;
     CFAbsoluteTime backend_started = CFAbsoluteTimeGetCurrent();
-    if (use_mpsgraph_f32) {
+    if (use_mpp_f32) {
+        if (!run_resident_matrix_batch_linear_mpp_f32(device, queue, weight_path,
+                                                      matrix, bInput, bOut,
+                                                      batch_tokens,
+                                                      &matrix_f32_elapsed,
+                                                      &accelerator_elapsed)) {
+            return 1;
+        }
+    } else if (use_mpsgraph_f32) {
         if (!run_resident_matrix_batch_linear_mpsgraph_f32(device, queue, weight_path,
                                                            matrix, bInput, bOut,
                                                            batch_tokens,
@@ -15573,10 +15775,11 @@ static NSString *resident_linear_server_backend(NSDictionary *request) {
     }
     NSString *backend = (NSString *)value;
     if (![backend isEqualToString:@"custom-metal"] &&
+        ![backend isEqualToString:@"mpp-f32"] &&
         ![backend isEqualToString:@"mpsgraph-f32"] &&
         ![backend isEqualToString:@"mps-matrix-f32"]) {
         fprintf(stderr,
-                "server prefill_linear_backend must be custom-metal, mpsgraph-f32, or mps-matrix-f32\n");
+                "server prefill_linear_backend must be custom-metal, mpp-f32, mpsgraph-f32, or mps-matrix-f32\n");
         return nil;
     }
     return backend;
@@ -21011,10 +21214,11 @@ int main(int argc, const char **argv) {
                 return 2;
             }
             if (![prefill_linear_backend isEqualToString:@"custom-metal"] &&
+                ![prefill_linear_backend isEqualToString:@"mpp-f32"] &&
                 ![prefill_linear_backend isEqualToString:@"mpsgraph-f32"] &&
                 ![prefill_linear_backend isEqualToString:@"mps-matrix-f32"]) {
                 fprintf(stderr,
-                        "--prefill-linear-backend must be custom-metal, mpsgraph-f32, or mps-matrix-f32\n");
+                        "--prefill-linear-backend must be custom-metal, mpp-f32, mpsgraph-f32, or mps-matrix-f32\n");
                 return 2;
             }
             uint64_t max_matrix_bytes = 0;
