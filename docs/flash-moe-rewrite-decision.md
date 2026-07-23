@@ -17,6 +17,12 @@ Objective-C/C++/Metal process with direct expert reads into reusable Metal
 buffers, layer-level command-buffer scheduling, GPU-side residual/combine/norm
 boundaries, and no Python/file handoff inside the token loop.
 
+Final outcome, 2026-07-23: that persistent path now runs the real GLM-5.2
+MXFP4 checkpoint. A safe learned 10 GiB expert set reached `1.083 tok/s`
+steady decode; the best context=1 projection is `1.427 tok/s`, so the runtime
+remains below the `5 tok/s` continuation gate. See
+`docs/real-glm-validation.md`.
+
 ## Evidence
 
 The earlier paper behind this direction is Apple's

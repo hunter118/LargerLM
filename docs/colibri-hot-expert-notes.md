@@ -1,192 +1,136 @@
 # Colibri-Inspired Hot Expert Work
 
-Date: 2026-07-22
+Date: 2026-07-23
 
-## Status
+## Final Status
 
-The performance project is active again for one narrow hypothesis: GLM expert
-usage may be skewed enough that a learned resident hot set removes much of the
-SSD traffic seen by the original LargerLM route.
+The Colibri hypothesis was tested with real GLM-5.2 MXFP4 weights on the target
+M5 Max 128 GB machine. Learned expert residency helps, but the safe improvement
+is not large enough to approach `5 tok/s`.
 
-This is not yet a real-model speed result. The profiler, runtime route
-telemetry, residency planner, hard-pinned hot store, and adaptive per-layer LRU
-are integrated and pass synthetic Metal tests. They still need to be measured
-with GLM-5.2 weights.
+- macOS page-cache baseline: `0.858 tok/s` steady.
+- Safe learned 10 GiB expert set: `1.083 tok/s` steady.
+- Generated tokens were identical.
+- The accepted cache reduced steady expert reads from `11.206 GiB/token` to
+  `5.94-7.17 GiB/token`.
 
-## What Colibri Changes
+See [the validation report](real-glm-validation.md) for the complete A/B.
+
+## What Was Reused
 
 [Colibri](https://github.com/JustVugg/colibri) keeps dense weights resident and
-streams routed experts. Its important additions are:
+streams routed experts. The quality-preserving parts relevant to LargerLM are:
 
-- a persistent expert-frequency file and learned pinned hot set;
-- per-layer LRU caches and safe turn-boundary repinning;
-- batch union so a selected expert is read once for all active tokens;
-- adjacent expert matrices loaded with one bounded read;
-- layer-ahead prefetch and an RSS guard that can shrink caches;
-- optional cache-aware routing, which is disabled by default because it can
-  change model output.
+- persistent expert-frequency telemetry;
+- a learned per-layer hot set;
+- bounded per-layer LRU policy;
+- batch union and adjacent range reads;
+- memory-pressure refusal;
+- routing remains unchanged.
 
-The quality-preserving pieces are directly relevant to LargerLM. Cache-aware
-routing is not part of the current plan. See Colibri's
-[tuning guide](https://github.com/JustVugg/colibri/blob/main/docs/tuning.md),
-[cache-aware routing note](https://github.com/JustVugg/colibri/blob/main/docs/CACHE_ROUTE.md),
-and [Metal notes](https://github.com/JustVugg/colibri/blob/main/docs/metal.md).
+LargerLM accepts Colibri `layer expert count` files, generic JSON/JSONL route
+events, native generation `expert_routes`, and prefill hotspot reports. The
+planner ranks observations by count per expert byte and emits a runtime
+consumable `largerlm.expert_pin_plan.v1`.
 
-Colibri reports `2.06 tok/s` on an M5 Max with a learned pinned set of about
-46.9 GB. That is useful evidence that expert popularity matters, but it is not
-evidence that LargerLM or GLM-5.2 will reach `5 tok/s`.
+Cache-aware routing is deliberately excluded because it changes model
+semantics.
 
-## 128 GB Memory Envelope
+## What Flash-MoE Changed
 
-The `m5-max-128g-safe` profile separates expert memory into two tiers:
+A code review of [Flash-MoE](https://github.com/danveloper/flash-moe) showed
+that its retained fast path relies heavily on the macOS file cache. Its own
+experiments found a custom LRU slower, temporal prediction slower, and read
+advice capable of increasing concurrent GPU time on unified memory.
 
-- 44 GiB hard-pinned hot experts;
-- up to 36 GiB of evictable expert LRU;
-- 16 GiB maximum runtime live working set;
-- 24 GiB minimum available unified-memory guard.
+That changed LargerLM's default:
 
-This permits an 80 GiB expert working set only while memory pressure is low.
-It is an experimental ceiling, not the default. Pinning the full 80 GiB would
-be unsafe: adding dense weights, Metal/KV scratch, the OS, drivers, page tables,
-and the 24 GiB guard would exceed the machine's 128 GB capacity. Even below
-that ceiling, application-owned buffers displace the macOS file cache and can
-make expert reads slower. The runtime evicts adaptive entries before crossing
-the guard and refuses execution or new cache allocations if pressure remains
-high.
+1. trust the OS page cache;
+2. add only a small measured hot set;
+3. use parallel `pread` into bounded reusable Metal staging buffers;
+4. avoid speculative expert prefetch that depends on an unconfirmed route.
 
-## Flash-MoE Cache Result
+This also explains why a weaker machine can report a better speed on a
+different model. GLM-5.2 reads `11.206 GiB/token` of routed experts, about
+`7.08x` the Qwen-shaped Flash-MoE comparison used by the viability report, and
+still performs substantial MLA and attention-output work.
 
-A fresh review of Flash-MoE's retained fast path changes the benchmark order.
-Its author measured the OS page cache at about a 71% hit rate and found that
-removing a custom Metal LRU improved throughput by 38%. Temporal expert
-prediction was 18% slower, while `F_RDADVISE` reduced expert I/O but increased
-concurrent GPU time by 73% because SSD DMA and Metal share the unified-memory
-fabric. Its final path uses parallel `pread` directly into aligned shared Metal
-buffers, overlaps only work that does not require route prediction, defers the
-expert command buffer, and otherwise trusts macOS.
+## Why The Profile Is 10 GiB
 
-LargerLM already has the same quality-preserving direct-read, aligned reusable
-buffer, parallel-worker, and deferred-submit foundations. Its custom cache is
-therefore opt-in. Real GLM-5.2 testing must compare, in this order:
+The first experimental profile allowed 44 GiB hard residency plus 36 GiB
+adaptive residency. That was a physical-memory envelope, not a GPU working-set
+envelope.
 
-1. no application cache, allowing the largest OS page cache;
-2. a smaller learned hot set with a bounded adaptive tier;
-3. the 44+36 GiB upper bound.
+The target M5 Max reports only about 17.4 GiB as its recommended Metal working
+set. The real runtime already needs about 5.5 GiB for MLA KV-B, staging,
+activations, and logits. Real tests found:
 
-The 80 GiB case is retained because GLM routing may be more skewed than
-Flash-MoE's Qwen routing. It wins only if the measured reduction in SSD bytes
-outweighs lost page-cache capacity, memory pressure, and lookup/allocation cost.
+- 1 GiB expert residency stayed correct and roughly neutral;
+- 10 GiB produced a 15.91 GiB live estimate and the best accepted result;
+- 11 GiB produced a 16.95 GiB live estimate and stayed correct;
+- 12 GiB was refused by the normal 17.4 GiB live cap;
+- a manually raised cap with 44 GiB pinned plus 16.1 GiB adaptive became
+  slower and changed generated tokens.
 
-## Usage Profiler And Plan
+The published `m5-max-128g-safe` profile therefore uses:
 
-`largerlm.expert_usage` accepts:
+- 10 GiB hard-pinned experts;
+- no application-owned adaptive expert tier;
+- 16 GiB total Metal live cap, including the expert cache;
+- 24 GiB minimum system-available memory;
+- macOS page cache for the rest.
 
-- Colibri-style `layer expert count` files;
-- JSON or JSONL route events with `layer` and `experts`;
-- per-layer LargerLM router JSON with `--default-layer`;
-- LargerLM prefill hotspot results, de-duplicated across copy/range views.
+The remaining unified memory is still useful. It backs file-cache pages,
+resident model data, drivers, the desktop, and other system allocations. It
+just should not be exposed as tens of GiB of simultaneously active
+`MTLBuffer` resources.
 
-The persistent GLM runtime now includes `selected_experts` in standalone decode
-layer results and `expert_routes` in prompt/decode generation steps. These are
-complete top-k route observations and do not disable the fused router path.
+## Build A Plan
 
-Hotspot summaries are marked as incomplete telemetry. Use full route events for
-a meaningful projected cache-hit fraction.
-
-Create only a profile:
+Collect complete routes from one or more representative prompts, then run:
 
 ```bash
-python3 scripts/expert_usage_plan.py route-stats.jsonl \
-  --write-profile expert-usage-profile.json \
-  --write-colibri-usage .coli_usage
-```
-
-Create the bounded M5 Max plan after a prepared expert layout exists:
-
-```bash
-python3 scripts/expert_usage_plan.py route-stats.jsonl \
+python3 scripts/expert_usage_plan.py route-a.json route-b.json \
   --expert-layout artifacts/glm-5.2-mxfp4/largerlm-prepared/experts/layout.json \
   --m5-max-128g-safe \
   --write-profile expert-usage-profile.json \
-  --write-plan expert-pin-plan.json
+  --write-plan expert-pin-plan.json \
+  --write-colibri-usage .coli_usage
 ```
 
-The plan is quality preserving: it changes residency priority, not router
-selection. Selection is greedy by observed count per expert byte, so layers
-with different expert slot sizes use the RAM budget efficiently.
-
-The plan is consumed directly by `glm_moe_infer`:
+Pass the plan to the persistent Metal runtime:
 
 ```bash
-make -C metal glm_moe_infer
-
-metal/glm_moe_infer \
-  --prepared artifacts/glm-5.2-mxfp4/largerlm-prepared \
+python3 -m largerlm generate-metal-token-ids \
+  artifacts/glm-5.2-mxfp4/largerlm-prepared \
   --expert-pin-plan expert-pin-plan.json \
-  --generate-token-ids \
-  ...
+  --prompt-token-ids 150000 \
+  --max-new-tokens 8 \
+  --mmap-final-logits \
+  --cache-mla-kv-b-f32 \
+  --max-mla-kv-b-cache-mib 4608 \
+  --max-live-working-set-mib 16384 \
+  --min-free-unified-memory-gib 24
 ```
 
-At first execution the runtime validates the complete pin plan and available
-memory before allocating anything large. Planned experts are loaded into
-stable shared `MTLBuffer` objects. A route hit passes that buffer directly to
-the MXFP4 kernel; it does not copy the expert into a staging buffer. Misses use
-the existing bounded parallel `pread` path and are admitted to an evictable
-cache only when both the byte budget and memory guard permit it.
-
-Allocation requires both enough reclaimable pages to preserve the configured
-minimum and a normal macOS VM-pressure level. Warning or critical pressure
-refuses preload/cache growth. This is intentionally conservative for a 128 GB
-unified-memory machine where excessive pressure can make the whole desktop
-unresponsive.
-
-The adaptive budget is divided evenly across routed layers. Each layer has its
-own LRU so the normal layer-by-layer decode scan cannot evict early-layer
-experts merely because later layers ran more recently. Under actual system
-memory pressure the runtime may evict the globally oldest adaptive entry from
-any layer. Pinned entries are never selected for eviction.
-
-Runtime JSON includes `expert_resident_cache` plus per-layer and aggregate
-`expert_cache_hit_count`, `expert_cache_miss_count`, `expert_cache_hit_bytes`,
-SSD read counters, and a post-execution available-memory/VM-pressure snapshot.
-These fields are the basis for the later real-model decision.
+Runtime telemetry includes cache hits, misses, hit bytes, stores, evictions,
+pressure rejections, allocation size, and post-run system memory.
 
 ## M5 Neural Accelerators
 
-Apple documents a Neural Accelerator in each M5 GPU core. Metal Performance
-Primitives TensorOps is the direct low-level interface, while MPSGraph and MLX
-can use the hardware through optimized framework paths. See Apple's
-[M5 GPU ML talk](https://developer.apple.com/videos/play/tech-talks/111432/) and
-[MPP programming guide](https://developer.apple.com/download/files/Metal-Performance-Primitives-Programming-Guide.pdf).
+Direct MPP TensorOps is now validated on this M5 Max through the system
+framework. The 32x32x32 half-matmul probe passes with zero maximum absolute
+error. `auto-mpp` selects MPP for eligible large resident F32/BF16/F16 prefill
+matrices; MXFP4 and int4 remain on custom Metal.
 
-On this 40-core M5 Max, the existing LargerLM probe confirms Metal 4 tensors and
-MPSGraph execution. The resident batch-linear smoke also passes with automatic
-selection of `mpsgraph-f32` for a 128-token batch.
+For this GLM shape, only the 75 router matrices are directly eligible, about
+225 MiB and roughly 0.5% of router plus routed-expert FLOPs. The feature is
+useful for long-prompt prefill coverage, not batch-one decode throughput.
 
-Direct MPP TensorOps is not yet validated. The installed Xcode 26.5 SDK contains
-the MPP headers, but the separate Metal Toolchain is absent, and
-`xcodebuild -downloadComponent MetalToolchain` currently fails because the local
-Xcode plug-ins and system developer frameworks do not match. Fix that Xcode
-installation before building an offline MPP kernel.
+## Decision
 
-Neural Accelerators principally help compute-heavy batched prefill. They do not
-remove SSD latency from batch-one decode, so hot-expert residency remains the
-central decode optimization.
-
-## Validation And Next Milestones
-
-The no-weight Metal smoke now verifies pinned hits, adaptive hits, per-layer LRU
-eviction, unchanged MXFP4 output, reduced SSD task count, and refusal when the
-minimum-free-memory guard cannot be met. The composed context-1 decode smoke
-also passes.
-
-Remaining work:
-
-1. Finish the GLM-5.2 download and prepare a 4096-token package; this keeps the
-   initial decode cache near 372 MiB instead of about 16 GiB.
-2. Measure the no-cache baseline, then collect complete route telemetry and
-   compare smaller residency plans with the 44+36 GiB upper bound.
-3. Promote a cache policy only when it improves steady-state tok/s without
-   crossing the 24 GiB free-memory guard or raising VM pressure.
-4. Repair/install the Xcode Metal Toolchain and compare direct MPP TensorOps
-   against the working MPSGraph prefill path.
+The Colibri work improved the safe minimum runtime and answered the memory
+question, but it did not change the product decision. The optimistic
+context=1 projection is `1.427 tok/s`, still `3.50x` below the requested gate.
+Further work requires a different model/layout or independent `>=5 tok/s`
+evidence, not a larger application-owned expert cache.

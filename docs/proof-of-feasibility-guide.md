@@ -3,10 +3,9 @@
 LargerLM is a proof-of-feasibility project for running GLM-style MoE models on
 Apple Silicon when the full model is larger than unified memory. It is not a
 production inference engine and it is not a high-throughput serving stack. The
-original local GLM-5.2 MXFP4 route was sealed as a minimum runnable version:
-bounded generation works, but the measured and projected speed is below the
-`5 tok/s` continuation target. Performance exploration resumed on 2026-07-22
-for learned hot-expert residency and M5 prefill acceleration.
+local GLM-5.2 MXFP4 route is sealed as a minimum runnable version: bounded
+generation works, but the final real-weight measurements remain below the
+`5 tok/s` continuation target.
 
 The useful result is the engineering map: how to split a large MoE checkpoint
 into resident tensors and SSD-backed routed experts, how to keep memory bounded,
@@ -32,17 +31,14 @@ Practical notes:
 
 The current GLM-5.2 MXFP4 evidence says:
 
-- Real decode artifacts are around `0.9-1.0 tok/s`.
-- The best evidence-backed context=1 projection is `1.485 tok/s`.
-- The `5 tok/s` target is still `3.37x` away.
-- Routed expert traffic is about `11.206 GiB/token`; `5 tok/s` would need about
-  `56 GiB/s` of useful routed-expert reads before attention, kernels, logits, or
-  scheduling overhead.
+- No application expert cache reached `0.858 tok/s` steady decode.
+- A learned 10 GiB expert set reached `1.083 tok/s` with identical output.
+- The best evidence-backed context=1 projection is `1.427 tok/s`.
+- The `5 tok/s` target is still `3.50x` above that optimistic projection.
+- Uncached routed expert traffic is `11.206 GiB/token`.
 
-These numbers remain the baseline for the original all-streaming route. The
-reopened work must beat them by reducing actual SSD misses, not by projecting
-faster storage. See `docs/colibri-hot-expert-notes.md` for the active direction
-and `docs/minimal-usable-seal.md` for the historical stop decision.
+See `docs/real-glm-validation.md` for the measured A/B and
+`docs/minimal-usable-seal.md` for the final stop decision.
 
 ## Principle
 
@@ -101,19 +97,16 @@ Metal live cap and a 24 GiB free unified-memory admission guard. Those values
 are conservative; keep them conservative unless you are deliberately measuring a
 new envelope.
 
-The default residency policy is now to trust the macOS page cache. The reopened
-44 GiB hard tier plus 36 GiB adaptive tier remains an experimental upper bound,
-not the recommended launch profile. Application-owned expert buffers consume
-memory that macOS could otherwise use for frequency-aware file caching and can
-increase compression or GPU/SSD contention. The adaptive tier must shrink
-before the 24 GiB free-memory guard is crossed; 80 GiB is a conditional total
-expert working set, not an unconditional pinned allocation.
+The default residency policy trusts the macOS page cache and optionally adds a
+measured 10 GiB learned hot set. The 16 GiB Metal live cap includes that cache.
+This machine reports only about a 17.4 GiB recommended Metal working set, even
+though it has 128 GiB of physical unified memory.
 
-The Metal runtime also requires the macOS VM-pressure level to be normal. It
-validates the whole hard-pinned allocation before preload, then checks pressure
-again for every adaptive allocation. Adaptive entries use per-layer LRU quotas
-to avoid decode-order cache thrashing; warning or critical pressure stops cache
-growth rather than risking system-wide swapping.
+A manually unlocked 44 GiB hard plus 36 GiB adaptive experiment became slower
+and changed output after the first token. A 12 GiB static plan was correctly
+rejected by normal admission. Do not raise the live cap to expose tens of GiB
+as active `MTLBuffer` resources. Keep the 24 GiB system reserve and let macOS
+use remaining memory for file-cache pages.
 
 Build the no-weight plan with:
 
@@ -131,16 +124,13 @@ The resulting plan is an executable runtime input:
 metal/glm_moe_infer \
   --prepared artifacts/glm-5.2-mxfp4/largerlm-prepared \
   --expert-pin-plan expert-pin-plan.json \
-  --max-live-working-set-mib 98304 \
+  --max-live-working-set-mib 16384 \
   --min-free-unified-memory-gib 24 \
   ...
 ```
 
-The larger live cap includes expert residency; it does not mean the runtime
-will allocate 96 GiB immediately. Use this command only for the explicit-cache
-benchmark. The baseline omits both expert-cache flags. The 44 GiB hard tier is
-planned, while the adaptive tier grows only on misses and remains bounded by
-both its 36 GiB cap and the live memory guards.
+The generated M5 profile has no adaptive application cache. The remaining
+reusable experts stay under macOS page-cache control.
 
 ## Installation
 
@@ -197,8 +187,8 @@ Before treating a run as useful, check the evidence-backed target gate:
 ```bash
 python3 scripts/glm_metal_viability_report.py \
   artifacts/glm-5.2-mxfp4/largerlm-prepared \
-  --decode-telemetry artifacts/glm-5.2-mxfp4/largerlm-prepared/direct-cli-metal-runtime-kvbcache-tiled-matvecadd-9tok-latest.json \
-  --context1-collapse-plan artifacts/glm-5.2-mxfp4/largerlm-prepared/context1-o-proj-collapse-plan-latest.json \
+  --decode-telemetry artifacts/glm-5.2-mxfp4/largerlm-prepared/metal-heldout-cache10g-safe-p150000-8t.json \
+  --context1-collapse-plan artifacts/glm-5.2-mxfp4/largerlm-prepared/context1-o-proj-collapse-plan-current.json \
   --target-tok-s 5 \
   --require-below-target
 ```
@@ -212,20 +202,26 @@ To save the report:
 ```bash
 python3 scripts/glm_metal_viability_report.py \
   artifacts/glm-5.2-mxfp4/largerlm-prepared \
-  --decode-telemetry artifacts/glm-5.2-mxfp4/largerlm-prepared/direct-cli-metal-runtime-kvbcache-tiled-matvecadd-9tok-latest.json \
-  --context1-collapse-plan artifacts/glm-5.2-mxfp4/largerlm-prepared/context1-o-proj-collapse-plan-latest.json \
+  --decode-telemetry artifacts/glm-5.2-mxfp4/largerlm-prepared/metal-heldout-cache10g-safe-p150000-8t.json \
+  --context1-collapse-plan artifacts/glm-5.2-mxfp4/largerlm-prepared/context1-o-proj-collapse-plan-current.json \
   --target-tok-s 5 \
   --json > artifacts/glm-5.2-mxfp4/largerlm-prepared/glm-metal-viability-5tps-gate-latest.json
 ```
 
 ## Safe Smoke
 
-After a prepared artifact exists, use the audited smoke wrapper rather than
-hand-building a long command:
+After a prepared artifact exists, use a guarded Metal smoke:
 
 ```bash
-artifacts/glm-5.2-mxfp4/largerlm-prepared/smoke-text-safe.sh \
-  --write-result artifacts/glm-5.2-mxfp4/largerlm-prepared/smoke-text-latest.json
+python3 -m largerlm generate-metal-token-ids \
+  artifacts/glm-5.2-mxfp4/largerlm-prepared \
+  --prompt-token-ids 0 \
+  --max-new-tokens 1 \
+  --mmap-final-logits \
+  --cache-mla-kv-b-f32 \
+  --max-mla-kv-b-cache-mib 4608 \
+  --max-live-working-set-mib 16384 \
+  --min-free-unified-memory-gib 24
 ```
 
 This is intentionally small. It is a sanity check that the local prepared

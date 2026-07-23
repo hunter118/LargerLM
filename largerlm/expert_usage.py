@@ -7,8 +7,8 @@ from typing import Any, Iterable
 
 
 GIB = 1024**3
-M5_MAX_128G_SAFE_PIN_BUDGET_BYTES = 44 * GIB
-M5_MAX_128G_ADAPTIVE_EXPERT_CACHE_BYTES = 36 * GIB
+M5_MAX_128G_SAFE_PIN_BUDGET_BYTES = 10 * GIB
+M5_MAX_128G_ADAPTIVE_EXPERT_CACHE_BYTES = 0
 
 
 class ExpertUsageError(RuntimeError):
@@ -473,7 +473,7 @@ def build_pin_plan(
         plan["memory_envelope"] = {
             "unified_memory_gib": 128,
             "default_expert_cache_policy": "os_page_cache",
-            "experimental_upper_bound": True,
+            "experimental_upper_bound": False,
             "hard_pinned_expert_budget_gib": max_pin_bytes / GIB,
             "adaptive_evictable_expert_cache_gib": (
                 M5_MAX_128G_ADAPTIVE_EXPERT_CACHE_BYTES / GIB
@@ -482,20 +482,16 @@ def build_pin_plan(
                 (max_pin_bytes + M5_MAX_128G_ADAPTIVE_EXPERT_CACHE_BYTES) / GIB
             ),
             "runtime_live_cap_gib": 16,
+            "runtime_live_cap_includes_expert_cache": True,
             "minimum_free_unified_memory_gib": 24,
             "remaining_for_os_dense_and_other_resident_gib": (
-                128 - (max_pin_bytes / GIB) - 16 - 24
+                128 - 16 - 24
             ),
             "unallocated_headroom_at_maximum_expert_residency_gib": (
-                128
-                - (
-                    max_pin_bytes + M5_MAX_128G_ADAPTIVE_EXPERT_CACHE_BYTES
-                )
-                / GIB
-                - 16
-                - 24
+                128 - 16 - 24
             ),
-            "adaptive_cache_must_shrink_before_minimum_free_guard": True,
+            "adaptive_cache_must_shrink_before_minimum_free_guard": False,
+            "metal_recommended_working_set_bound": True,
             "requires_runtime_rss_guard": True,
         }
     return plan

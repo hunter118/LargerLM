@@ -1,99 +1,97 @@
 # LargerLM Minimum Runnable Seal
 
-Date: 2026-07-05
-
-Historical note: the original route was reopened on 2026-07-22 to investigate
-Colibri-style learned hot-expert residency, a bounded adaptive LRU, and M5
-Neural Accelerator prefill. The measurements below remain the baseline for the
-old all-streaming route; they are not a stop order for the reopened experiment.
+Date: 2026-07-23
 
 ## Decision
 
-Seal the current GLM-5.2 MXFP4 Apple Silicon route as a minimum runnable version
-and stop speculative optimization toward the 5 tok/s target.
+Seal the GLM-5.2 MXFP4 M5 Max route as a minimum runnable proof of feasibility
+and stop speculative work toward `5 tok/s`.
 
-The current evidence-backed ceiling is not close enough:
+The final real-weight evidence is:
 
-- Best real GLM decode artifacts are around `0.9-1.0 tok/s`.
-- The viability gate with the context=1 `o_proj*B_v` collapse projects
-  `1.485 tok/s`, about `1.60x` over the measured 9-token decode artifact.
-- The requested continuation target is `5.000 tok/s`; the best supported
-  projection is still `3.37x` short.
-- The routed expert read floor is still `11.206 GiB/token`; reaching
-  `5 tok/s` would require roughly `56 GiB/s` of sustained useful routed-expert
-  traffic before counting attention, kernels, logits, scheduling, or HTTP
-  overhead.
+- no application expert cache: `0.858 tok/s` steady decode;
+- safe learned 10 GiB expert set: `1.083 tok/s` steady decode;
+- identical eight-token held-out output between those runs;
+- optimistic context=1 `o_proj*B_v` projection: `1.427 tok/s`;
+- gap from that projection to `5 tok/s`: `3.50x`;
+- power-limited test machine, but no evidence for the required 3.5x full-pipeline
+  improvement at normal adapter power.
 
-The matching gate command is:
+The 44+36 GiB expert-cache hypothesis was also tested. After manually raising
+the Metal live cap it became slower and changed output, so it is rejected. The
+published M5 profile uses 10 GiB static residency and lets macOS manage the
+remaining reusable file pages.
+
+The matching viability gate is:
 
 ```bash
 python3 scripts/glm_metal_viability_report.py \
   artifacts/glm-5.2-mxfp4/largerlm-prepared \
-  --decode-telemetry artifacts/glm-5.2-mxfp4/largerlm-prepared/direct-cli-metal-runtime-kvbcache-tiled-matvecadd-9tok-latest.json \
-  --context1-collapse-plan artifacts/glm-5.2-mxfp4/largerlm-prepared/context1-o-proj-collapse-plan-latest.json \
+  --decode-telemetry \
+    artifacts/glm-5.2-mxfp4/largerlm-prepared/metal-heldout-cache10g-safe-p150000-8t.json \
+  --context1-collapse-plan \
+    artifacts/glm-5.2-mxfp4/largerlm-prepared/context1-o-proj-collapse-plan-current.json \
   --target-tok-s 5 \
   --require-below-target
 ```
 
-Expected target decision:
+Expected decision:
 
 ```text
 stop_at_minimal_usable
 ```
 
-## Minimum Usable Scope
+## Preserved Scope
 
-Keep these paths working and guarded:
+Keep these paths working:
 
-- Header/prepared-artifact inspection, sizing, disk, and launch-profile checks.
-- Safe text smoke for the local prepared GLM artifact.
-- Bounded Metal runtime generation with explicit live-memory and free-memory
-  guards.
-- Context=1 `o_proj*B_v` cache planning, validation, and resumable one-layer
-  build suggestions. This remains a narrow verified fast path, not a general
-  decode-speed solution.
-- Viability reporting with an explicit throughput target.
+- checkpoint and prepared-artifact validation;
+- 4096-token bounded package preparation;
+- persistent Metal token and text generation;
+- 10 GiB learned expert residency with unchanged routing;
+- MLA KV-B caching and mmap final logits;
+- MPP/MPSGraph prefill probes and `auto-mpp`;
+- explicit Metal live-memory and 24 GiB system reserve guards;
+- viability reporting against a user-supplied throughput target.
 
-Safe smoke:
-
-```bash
-artifacts/glm-5.2-mxfp4/largerlm-prepared/smoke-text-safe.sh \
-  --write-result artifacts/glm-5.2-mxfp4/largerlm-prepared/smoke-text-latest.json
-```
-
-Safe prepared server shape:
+Safe token generation:
 
 ```bash
-python3 -m largerlm serve-prepared artifacts/glm-5.2-mxfp4/largerlm-prepared \
-  --metal-runtime-generation \
-  --metal-binary metal/glm_moe_infer \
-  --metal-runtime-cache-mla-kv-b-f32 \
-  --metal-runtime-max-mla-kv-b-cache-mib 4608 \
+python3 -m largerlm generate-metal-token-ids \
+  artifacts/glm-5.2-mxfp4/largerlm-prepared \
+  --expert-pin-plan expert-pin-plan.json \
+  --prompt-token-ids 150000 \
+  --max-new-tokens 8 \
+  --mmap-final-logits \
+  --cache-mla-kv-b-f32 \
+  --max-mla-kv-b-cache-mib 4608 \
   --max-live-working-set-mib 16384 \
   --min-free-unified-memory-gib 24
 ```
 
-## Historical Stop Scope
+## Stop Scope
 
-Do not spend more time on these under the current GLM-5.2 MXFP4 layout:
+Do not continue these under the current model layout:
 
-- Chasing 5 tok/s with additional small attention-output kernel tweaks.
-- Building a general per-head collapsed cache: the modeled exact BF16 cache is
-  `29.250 GiB/token` and the int4 floor is still `7.312 GiB/token`.
-- Running uncapped real-weight experiments.
-- Running large Flash-MOE weight trials unless the user explicitly resumes that
-  comparison with downloaded weights available.
-- Downloading more huge model shards for this sealed route.
+- chasing `5 tok/s` with additional small kernel changes;
+- increasing application-owned expert residency beyond the Metal working-set
+  admission cap;
+- enabling a large adaptive cache by raising `--max-live-working-set-mib`;
+- building the 4.02T-FMA context=1 cache as though it were a sustained decode
+  solution;
+- downloading a second huge checkpoint only to reproduce another engine's
+  model-specific headline.
 
 ## Restart Criteria
 
-Only reopen the performance project if at least one condition changes:
+Reopen performance work only when at least one condition changes:
 
-- A model/layout reduces routed expert traffic by about `5x` while preserving the
-  target model quality.
-- A new packed expert format proves sustained useful routed-expert throughput
-  near the required range on the local machine.
-- A different engine demonstrates real GLM-family `>=5 tok/s` decode on this
-  class of Mac with comparable memory safety.
-- The user lowers the target below the current evidence-backed ceiling and wants
-  a polished local demo rather than a 5 tok/s system.
+- a GLM-compatible model/layout reduces routed expert traffic by several times;
+- another engine demonstrates real comparable GLM-family `>=5 tok/s` decode on
+  this class of Mac with memory guards;
+- Apple exposes a materially different MXFP4 execution path for the M5 Neural
+  Accelerators;
+- the throughput requirement is lowered to roughly the measured 1 tok/s class.
+
+The full experiment record is in
+[GLM-5.2 MXFP4 validation](real-glm-validation.md).

@@ -15,9 +15,10 @@ more valuable as OS page cache, KV/DSA cache, and temporary Metal buffers.
 ## Current GLM-5.2 M5 Max Baseline
 
 The prepared GLM-5.2 MXFP4 package at
-`artifacts/glm-5.2-mxfp4/largerlm-prepared` is sufficient for the current
-minimal end-to-end smoke: a 17-token prompt plus one generated token, using the
-locked `launch-profile-17tok-chunk16-accel.json` and its launch audit.
+`artifacts/glm-5.2-mxfp4/largerlm-prepared` passed storage validation and real
+generation. The final held-out Metal A/B measured `0.858 tok/s` without an
+application expert cache and `1.083 tok/s` with the safe learned 10 GiB set.
+See `docs/real-glm-validation.md`.
 For opt-in MLA key-cache experiments, use
 `launch-profile-17tok-chunk16-accel-keycache.json`; it is a request-checked,
 safe-to-replay launch profile that carries the same memory, SSD, shape, chunk,
@@ -1738,21 +1739,17 @@ It intentionally
 avoids a large application-owned weight cache; richer continuous batching,
 streaming, tool calling, and prefix sharing remain a later scheduling layer.
 
-The default serving profile still prefers the OS page cache over a large
-application-owned cache. The explicit M5 Max 128 GB profile is the exception:
-it may consume a measured `largerlm.expert_pin_plan.v1` with 44 GiB of hard
-residency and at most 36 GiB of adaptive residency. That path requires a normal
-macOS VM-pressure level and preserves at least 24 GiB of available unified
-memory; it refuses preload when the complete hard set does not fit.
+The default serving profile prefers the OS page cache over a large
+application-owned cache. The measured M5 Max 128 GB profile may consume a
+`largerlm.expert_pin_plan.v1` with at most 10 GiB of hard residency and no
+adaptive application tier. The 16 GiB Metal live cap includes those buffers,
+and the runtime preserves at least 24 GiB of available unified memory.
 
 Pinned experts live in stable shared `MTLBuffer` objects and are passed directly
-to the MXFP4 kernels on route hits. Adaptive misses use the existing bounded
-parallel `pread` path, then enter a per-layer LRU only if the layer quota and
-memory guard allow it. Per-layer segmentation matters because decode scans
-layers in order: a global LRU alone would repeatedly evict early-layer entries
-after later layers complete. Under actual memory pressure, cross-layer eviction
-is allowed for adaptive entries; hard-pinned entries are never eviction
-candidates. Routing and weights are unchanged.
+to the MXFP4 kernels on route hits. Misses use the existing bounded parallel
+`pread` path and remain eligible for the macOS page cache. The older adaptive
+per-layer LRU remains implemented for experiments, but it is disabled in the
+published M5 profile. Routing and weights are unchanged.
 
 ## Packed Expert Format
 

@@ -158,14 +158,16 @@ def test_pin_plan_uses_byte_weighted_frequency_and_stays_in_budget(
     assert plan["planner_only"] is False
     assert plan["runtime_consumable"] is True
     assert plan["runtime_cli_flag"] == "--expert-pin-plan"
-    assert plan["memory_envelope"]["maximum_expert_resident_gib"] == 80
+    assert plan["memory_envelope"]["maximum_expert_resident_gib"] == 10
     assert plan["memory_envelope"]["default_expert_cache_policy"] == "os_page_cache"
-    assert plan["memory_envelope"]["experimental_upper_bound"] is True
+    assert plan["memory_envelope"]["experimental_upper_bound"] is False
+    assert plan["memory_envelope"]["runtime_live_cap_includes_expert_cache"] is True
+    assert plan["memory_envelope"]["metal_recommended_working_set_bound"] is True
     assert (
         plan["memory_envelope"][
             "unallocated_headroom_at_maximum_expert_residency_gib"
         ]
-        == 8
+        == 88
     )
 
 
@@ -213,4 +215,4 @@ def test_cli_writes_m5_max_profile_and_plan(tmp_path: Path) -> None:
     assert json.loads(profile_path.read_text())["total_selections"] == 12
     plan = json.loads(plan_path.read_text())
     assert plan["target_profile"] == "m5-max-128g-safe"
-    assert plan["memory_envelope"]["maximum_expert_resident_gib"] == 80
+    assert plan["memory_envelope"]["maximum_expert_resident_gib"] == 10

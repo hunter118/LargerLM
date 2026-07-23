@@ -6,10 +6,11 @@ MoE LLMs larger than unified memory.
 The first target is GLM-style `glm_moe_dsa` checkpoints, with 4-bit routed
 experts stored on SSD and only the active experts streamed per token. The
 current GLM-5.2 MXFP4 route is sealed as a minimum runnable version rather than
-an active 5 tok/s optimization project: measured decode is around `0.9-1.0 tok/s`
-and the best evidence-backed projection is `1.485 tok/s`, below the `5 tok/s`
-continuation threshold. See `docs/minimal-usable-seal.md` for the stop decision,
-safe runnable entry points, and restart criteria.
+an active 5 tok/s optimization project. The final real-weight held-out A/B
+measured `0.858 tok/s` without an application expert cache and `1.083 tok/s`
+with the safe learned 10 GiB set; the optimistic context=1 projection is
+`1.427 tok/s`. See `docs/real-glm-validation.md` and
+`docs/minimal-usable-seal.md`.
 
 For a concise publishable guide with device requirements, principles, safety
 guards, and usage commands, start with
