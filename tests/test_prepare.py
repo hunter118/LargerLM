@@ -12852,6 +12852,38 @@ def test_benchmark_summary_profile_preserves_prefill_acceleration_gates(
     assert "--prefill-linear-backend" in profile["argv"]
 
 
+def test_benchmark_summary_profile_keeps_auto_mpp_internal(
+    tmp_path: Path,
+) -> None:
+    prepared = _write_minimal_prepared_manifest(tmp_path)
+    manifest = load_prepared_manifest(prepared)
+    token_result = TokenGenerationResult(
+        prompt_token_ids=(0,),
+        generated_token_ids=(2,),
+        steps=(),
+        work_dir=tmp_path,
+        kept_work_dir=False,
+        max_context_tokens=4,
+        sampling_temperature=0.0,
+        sampling_top_p=1.0,
+        elapsed_seconds=1.0,
+    )
+
+    result = summarize_generation(
+        manifest,
+        token_result,
+        prefill_linear_backend="auto-mpp",
+        configured_prefill_linear_backend="auto",
+        run_mpp_probe=True,
+    )
+
+    profile = result.suggested_launch_profile
+    assert profile is not None
+    assert "prefill_acceleration_flags" not in profile["sections"]
+    assert "--run-mpp-probe" in profile["argv"]
+    assert "auto-mpp" not in profile["argv"]
+
+
 def test_benchmark_prepared_token_ids_uses_config_tie_embedding_policy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

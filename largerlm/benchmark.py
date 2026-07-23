@@ -1313,6 +1313,7 @@ def summarize_generation(
     top_k: int = 8,
     stage_align_bytes: int = 4096,
     prefill_linear_backend: str = "auto",
+    configured_prefill_linear_backend: str | None = None,
     prefill_mpsgraph_min_batch_tokens: int = AUTO_MPSGRAPH_MIN_BATCH_TOKENS,
     prefill_mpsgraph_min_matrix_dim: int = AUTO_MPSGRAPH_MIN_DIM,
     require_prepared_memory_profile: bool = False,
@@ -1326,6 +1327,11 @@ def summarize_generation(
     run_mpsgraph_probe: bool = False,
 ) -> GenerationBenchmark:
     generated = len(result.generated_token_ids)
+    launch_profile_prefill_backend = (
+        prefill_linear_backend
+        if configured_prefill_linear_backend is None
+        else str(configured_prefill_linear_backend)
+    )
     elapsed = result.elapsed_seconds
     tok_s = generated / elapsed if generated and elapsed > 0 else 0.0
     gib_s = (
@@ -1800,7 +1806,7 @@ def summarize_generation(
             allow_router_gate_only_prefill_acceleration
         ),
         prefill_min_accelerated_flop_fraction=prefill_min_accelerated_flop_fraction,
-        prefill_linear_backend=prefill_linear_backend,
+        prefill_linear_backend=launch_profile_prefill_backend,
         prefill_mpsgraph_min_batch_tokens=prefill_mpsgraph_min_batch_tokens,
         prefill_mpsgraph_min_matrix_dim=prefill_mpsgraph_min_matrix_dim,
         compile_mpp_probe=compile_mpp_probe,
@@ -2083,6 +2089,9 @@ def benchmark_prepared_token_ids(
                 generation_kwargs["allow_tied_embeddings"] = (
                     cfg.tie_word_embeddings is not False
                 )
+    configured_prefill_linear_backend = str(
+        generation_kwargs.get("prefill_linear_backend", "auto") or "auto"
+    )
     runtime_prefill_linear_backend = _require_benchmark_request_admission(
         prepared=prepared,
         runner_path=runner_path,
@@ -2171,6 +2180,7 @@ def benchmark_prepared_token_ids(
         top_k=top_k,
         stage_align_bytes=int(stage_align_kib * 1024),
         prefill_linear_backend=prefill_linear_backend,
+        configured_prefill_linear_backend=configured_prefill_linear_backend,
         prefill_mpsgraph_min_batch_tokens=mpsgraph_min_batch_tokens,
         prefill_mpsgraph_min_matrix_dim=mpsgraph_min_matrix_dim,
         require_prepared_memory_profile=memory_profile_required,
