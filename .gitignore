@@ -11,8 +11,11 @@ artifacts/
 experts/
 packed_experts/
 packed_experts_*/
+third_party/colibri/
 
 # Local build outputs.
 metal/glm_moe_infer
 metal/largerlm-runner
 metal/prefill-backend-probe
+metal/mtlio-expert-io-bench
+metal/pread-expert-io-bench

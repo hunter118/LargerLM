@@ -2,6 +2,10 @@
 
 Date: 2026-07-23
 
+> Historical decision, reopened on 2026-07-24 after direct Colibri testing.
+> See [Colibri M5 Max Optimization](colibri-m5-optimization.md) for the active
+> quality-preserving and experimental approximately 5 tok/s paths.
+
 ## Decision
 
 Seal the GLM-5.2 MXFP4 M5 Max route as a minimum runnable proof of feasibility

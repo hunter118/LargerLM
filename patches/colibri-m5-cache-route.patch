@@ -1,0 +1,414 @@
+diff --git a/c/backend_metal.h b/c/backend_metal.h
+index 35c4931..f320d4b 100644
+--- a/c/backend_metal.h
++++ b/c/backend_metal.h
+@@ -78,9 +78,12 @@ int coli_metal_layer_decode(float *x,
+     const void *shd_w, const float *shd_s, int shd_fmt,
+     const float *router_w, const float *router_bias,
+     int E, int K, int Ksel, float topp, int normk, float rscale,
++    const uint8_t *cache_resident, int route_j, int route_m,
+     float *Lc, float *Rc, int S, int pos_base, int st0,
+     float eps, float theta, float ascale,
+-    float *inrm_out, float *nrm_out, float *sh_out, int *idx_out, float *w_out, int *keff_out);
++    float *inrm_out, float *nrm_out, float *sh_out,
++    int *idx_out, float *w_out, int *keff_out,
++    int *true_idx_out, float *true_w_out);
+
+ int coli_metal_gemm(float *y, const float *x, const void *weights, const float *scales,
+                     int fmt, int S, int I, int O);   /* large-batch sync GEMM; 0 -> CPU */
+@@ -101,6 +104,14 @@ int coli_metal_gemm(float *y, const float *x, const void *weights, const float *
+ int coli_metal_rtop8(int par, const float *sig, const float *bias, int S, int E, int K,
+                      int Ksel, float topp, int normk, float rscale,
+                      int *idx, float *w, int *keff);
++/* Experimental cache-aware router probe. Keeps true top-J, then fills from resident
++ * experts in the exact top-M ranking. true_idx/true_w expose the unmodified top-K
++ * selection for route-fidelity telemetry. E<=256 and Ksel<=route_m<=64. */
++int coli_metal_rtop8_cache(const float *sig, const float *bias,
++                           const uint8_t *resident, int S, int E, int K, int Ksel,
++                           int route_j, int route_m, float topp, int normk, float rscale,
++                           int *idx, float *w, int *keff,
++                           int *true_idx, float *true_w);
+ void coli_metal_attn_counts(uint64_t *ok, double *wall, double *kernel);
+ void coli_metal_attn_lat(double *ksched, double *gsched);
+ int coli_metal_attn_decode(const float *x,
+diff --git a/c/backend_metal.mm b/c/backend_metal.mm
+index 6ec3fb4..839694e 100644
+--- a/c/backend_metal.mm
++++ b/c/backend_metal.mm
+@@ -276,6 +276,69 @@ kernel void r_top8_par(device const float* sig [[buffer(0)]], device const float
+   if(normk){ float sm=0; for(int kk=0;kk<Ke;kk++) sm+=ww[kk]; sm+=1e-20f; for(int kk=0;kk<Ke;kk++) ww[kk]/=sm; }
+   for(int kk=0;kk<Ke;kk++) ww[kk]*=rscale;
+ }
++// Experimental cache-aware max-rank selection. One simdgroup builds the exact
++// top-M ranking in parallel, then lane 0 keeps true top-J and fills from resident
++// experts before falling back to rank order. true_idx/true_w preserve quality
++// telemetry against the unmodified top-K router.
++kernel void r_top_cache_par(
++    device const float* sig [[buffer(0)]], device const float* bias [[buffer(1)]],
++    device int* idx [[buffer(2)]], device float* w [[buffer(3)]],
++    device int* keff [[buffer(4)]], constant int& E [[buffer(5)]],
++    constant int& K [[buffer(6)]], constant int& Ksel [[buffer(7)]],
++    constant float& topp [[buffer(8)]], constant int& normk [[buffer(9)]],
++    constant float& rscale [[buffer(10)]],
++    constant uchar* resident [[buffer(11)]],
++    device int* true_idx [[buffer(12)]], device float* true_w [[buffer(13)]],
++    constant int& route_j [[buffer(14)]], constant int& route_m [[buffer(15)]],
++    uint s [[threadgroup_position_in_grid]],
++    uint slane [[thread_index_in_simdgroup]]) {
++  if(E>256 || route_m>K*8 || route_m<Ksel) return;
++  device const float* sg=sig+(long)s*E;
++  device int* id_=idx+(long)s*K; device float* ww=w+(long)s*K;
++  device int* ti=true_idx+(long)s*K; device float* tw=true_w+(long)s*K;
++  threadgroup int rank_id[64]; threadgroup float rank_w[64];
++  int per=(E+31)/32, base=(int)slane*per;
++  float ch[8]; uint taken=0u;
++  for(int j=0;j<per;j++){ int e=base+j; ch[j]=(e<E)?sg[e]+bias[e]:-1e30f; }
++  for(int kk=0;kk<route_m;kk++){
++    float bv=-1e30f; int bi=0x7FFFFFFF;
++    for(int j=0;j<per;j++) if(!(taken&(1u<<j)) && ch[j]>bv){ bv=ch[j]; bi=base+j; }
++    for(uint off=16;off>0;off>>=1){
++      float ov=simd_shuffle_down(bv,off); int oi=simd_shuffle_down(bi,off);
++      if(ov>bv || (ov==bv && oi<bi)){ bv=ov; bi=oi; }
++    }
++    bi=simd_broadcast(bi,0);
++    if(bi>=base && bi<base+per) taken|=1u<<(bi-base);
++    if(slane==0){ rank_id[kk]=bi; rank_w[kk]=sg[bi]; }
++  }
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++  if(slane!=0) return;
++  for(int kk=0;kk<Ksel;kk++){ ti[kk]=rank_id[kk]; tw[kk]=rank_w[kk]; }
++  int J=clamp(route_j,0,Ksel), chosen=0;
++  for(int r=0;r<J;r++){ id_[chosen]=rank_id[r]; ww[chosen]=rank_w[r]; chosen++; }
++  for(int r=J;r<route_m && chosen<Ksel;r++){
++    int e=rank_id[r], duplicate=0;
++    for(int j=0;j<chosen;j++) if(id_[j]==e){ duplicate=1; break; }
++    if(!duplicate && resident[e]){ id_[chosen]=e; ww[chosen]=rank_w[r]; chosen++; }
++  }
++  for(int r=0;r<route_m && chosen<Ksel;r++){
++    int e=rank_id[r], duplicate=0;
++    for(int j=0;j<chosen;j++) if(id_[j]==e){ duplicate=1; break; }
++    if(!duplicate){ id_[chosen]=e; ww[chosen]=rank_w[r]; chosen++; }
++  }
++  int Ke=Ksel;
++  if(topp>0.0f && topp<1.0f){
++    for(int a=1;a<Ksel;a++){ int ii=id_[a]; float wv=ww[a]; int b=a-1;
++      while(b>=0 && ww[b]<wv){ ww[b+1]=ww[b]; id_[b+1]=id_[b]; b--; }
++      ww[b+1]=wv; id_[b+1]=ii; }
++    float tot=1e-20f; for(int kk=0;kk<Ksel;kk++) tot+=ww[kk];
++    float cum=0; for(int kk=0;kk<Ksel;kk++){ cum+=ww[kk]; if(cum>=topp*tot){ Ke=kk+1; break; } }
++  }
++  keff[s]=Ke;
++  if(normk){ float sm=0; for(int kk=0;kk<Ke;kk++) sm+=ww[kk]; sm+=1e-20f;
++    for(int kk=0;kk<Ke;kk++) ww[kk]/=sm; }
++  for(int kk=0;kk<Ke;kk++) ww[kk]*=rscale;
++}
+ )METAL";
+
+ struct ColiMetalTensor {
+@@ -288,7 +351,7 @@ static id<MTLDevice> g_dev;
+ static id<MTLCommandQueue> g_queue;
+ static id<MTLComputePipelineState> g_gemv, g_moe_gemv, g_moe_silu;
+ static id<MTLComputePipelineState> g_a_rms, g_a_rope, g_a_copy, g_a_qabs, g_a_score, g_a_smax, g_a_clat, g_a_ctx;
+-static id<MTLComputePipelineState> g_a_add, g_r_router, g_r_top8, g_r_top8p;
++static id<MTLComputePipelineState> g_a_add, g_r_router, g_r_top8, g_r_top8p, g_r_topcachep;
+ static int g_rtop8_par = 1;      // COLI_RTOP8 (default ON); COLI_RTOP8=0 opts out to the
+                                   // serial kernel — see coli_metal_init.
+ static int g_rtop8_width_ok = 1; // hardware fact, independent of the policy gate above:
+@@ -434,7 +497,8 @@ extern "C" int coli_metal_init(void) {
+     g_a_rms=P("a_rmsnorm"); g_a_rope=P("a_rope"); g_a_copy=P("a_copy");
+     g_a_qabs=P("a_qabs"); g_a_score=P("a_score"); g_a_smax=P("a_smax"); g_a_clat=P("a_clat"); g_a_ctx=P("a_ctx");
+     g_a_add=P("a_add"); g_r_router=P("r_router"); g_r_top8=P("r_top8"); g_r_top8p=P("r_top8_par");
+-    if(!g_a_add||!g_r_router||!g_r_top8||!g_r_top8p){ fprintf(stderr,"[metal] tail pipelines failed\n"); g_dev=nil; return 0; }
++    g_r_topcachep=P("r_top_cache_par");
++    if(!g_a_add||!g_r_router||!g_r_top8||!g_r_top8p||!g_r_topcachep){ fprintf(stderr,"[metal] tail pipelines failed\n"); g_dev=nil; return 0; }
+     // r_top8_par's reduction hardcodes SIMD width 32 (shuffle-down offsets 16..1, one
+     // 32-thread threadgroup per row). True on all Apple Silicon shipped to date, but a
+     // non-32-width device would reduce wrongly AND race multiple lane-0 writers, so this
+@@ -593,7 +657,7 @@ extern "C" int coli_metal_matmul(ColiMetalTensor **tp, float *y, const float *x,
+ // ---- fused decode attention scratch (GLM-5.2 dims) ----
+ enum { AH=6144, AHEADS=64, AQLORA=2048, AKVL=512, AROPE=64, AVH=256, AQH=256, ANOPE=192, AROWSH=448, AHQH=AHEADS*AQH, AHVH=AHEADS*AVH, AMAXS=4 };
+ static id<MTLBuffer> ax_,aqr_,aqf_,acomp_,aqabs_,ascore_,aclat_,actx_,aout_,aqaln_,akvaln_; static size_t ascore_cap;
+-static id<MTLBuffer> axr_,anrm_,ash1_,ash2_,ashout_,asig_,aidx_,aw_,akeff_;   // full-layer tail
++static id<MTLBuffer> axr_,anrm_,ash1_,ash2_,ashout_,asig_,aidx_,aw_,akeff_,atrueidx_,atruew_;   // full-layer tail
+ static void attn_scratch_init(){
+   if(ax_) return;
+   auto L=[&](size_t n){ return [g_dev newBufferWithLength:n*AMAXS options:g_res_opts]; };
+@@ -602,6 +666,7 @@ static void attn_scratch_init(){
+   aqaln_=L(AQLORA*4/AMAXS); akvaln_=L(AKVL*4/AMAXS);   // norm weights are per-tensor, not per-row
+   axr_=L(AH*4); anrm_=L(AH*4); ash1_=L(2048*4); ash2_=L(2048*4); ashout_=L(AH*4);
+   asig_=L(256*4); aidx_=L(8*4); aw_=L(8*4); akeff_=L(4);
++  atrueidx_=L(8*4); atruew_=L(8*4);
+ }
+ // y[S,O] = quantized-weight(w) applied to xin[S,I]. Weights are registered (page-aligned,
+ // zero-copy) at model load; resolve to (buffer,offset). Returns false to fall back to CPU.
+@@ -733,11 +798,18 @@ extern "C" int coli_metal_layer_decode(float *x,
+     const void* shd_w,const float* shd_s,int shd_fmt,
+     const float *router_w, const float *router_bias,
+     int E, int K, int Ksel, float topp, int normk, float rscale,
++    const uint8_t *cache_resident, int route_j, int route_m,
+     float *Lc, float *Rc, int S, int pos_base, int st0,
+     float eps, float theta, float ascale,
+-    float *inrm_out, float *nrm_out, float *sh_out, int *idx_out, float *w_out, int *keff_out) {
++    float *inrm_out, float *nrm_out, float *sh_out,
++    int *idx_out, float *w_out, int *keff_out,
++    int *true_idx_out, float *true_w_out) {
+   if(!g_dev) return 0;
+   if(st0!=0 || S<1 || S>AMAXS || E!=256 || K!=8) return 0;
++  int cache_route=cache_resident!=NULL;
++  if(cache_route && (!g_rtop8_width_ok || !g_r_topcachep ||
++                     route_m<Ksel || route_m>K*8 || !true_idx_out || !true_w_out))
++    return 0;
+   int T=pos_base+S; const int SI=2048;
+   @autoreleasepool {
+     attn_scratch_init();
+@@ -797,12 +869,18 @@ extern "C" int coli_metal_layer_decode(float *x,
+       // so a future relaxation of that gate (e.g. to admit REAP-pruned E=168 models into
+       // the fused path) degrades safely to the serial kernel instead of mis-dispatching.
+       int use_par = g_rtop8_par && g_rtop8_width_ok && E<=256;
+-      [e setComputePipelineState:use_par?g_r_top8p:g_r_top8];
++      [e setComputePipelineState:cache_route?g_r_topcachep:(use_par?g_r_top8p:g_r_top8)];
+       [e setBuffer:asig_ offset:0 atIndex:0]; [e setBuffer:rbB offset:rboff atIndex:1];
+       [e setBuffer:aidx_ offset:0 atIndex:2]; [e setBuffer:aw_ offset:0 atIndex:3]; [e setBuffer:akeff_ offset:0 atIndex:4];
+       [e setBytes:&E length:4 atIndex:5]; [e setBytes:&K length:4 atIndex:6]; [e setBytes:&Ksel length:4 atIndex:7];
+       [e setBytes:&topp length:4 atIndex:8]; [e setBytes:&normk length:4 atIndex:9]; [e setBytes:&rscale length:4 atIndex:10];
+-      if(use_par) [e dispatchThreadgroups:MTLSizeMake(S,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
++      if(cache_route){
++        [e setBytes:cache_resident length:(NSUInteger)E atIndex:11];
++        [e setBuffer:atrueidx_ offset:0 atIndex:12]; [e setBuffer:atruew_ offset:0 atIndex:13];
++        [e setBytes:&route_j length:4 atIndex:14]; [e setBytes:&route_m length:4 atIndex:15];
++        [e dispatchThreadgroups:MTLSizeMake(S,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
++      }
++      else if(use_par) [e dispatchThreadgroups:MTLSizeMake(S,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+       else        [e dispatchThreads:MTLSizeMake(S,1,1) threadsPerThreadgroup:MTLSizeMake(S,1,1)]; }
+     BAR();
+     // 6) shared down
+@@ -819,6 +897,10 @@ extern "C" int coli_metal_layer_decode(float *x,
+     memcpy(idx_out,[aidx_ contents],(size_t)S*K*4);
+     memcpy(w_out,[aw_ contents],(size_t)S*K*4);
+     memcpy(keff_out,[akeff_ contents],(size_t)S*4);
++    if(cache_route){
++      memcpy(true_idx_out,[atrueidx_ contents],(size_t)S*K*4);
++      memcpy(true_w_out,[atruew_ contents],(size_t)S*K*4);
++    }
+   }
+   return 1;
+ }
+@@ -890,6 +972,49 @@ extern "C" int coli_metal_rtop8(int par, const float *sig, const float *bias, in
+   return 1;
+ }
+
++extern "C" int coli_metal_rtop8_cache(
++    const float *sig, const float *bias, const uint8_t *resident,
++    int S, int E, int K, int Ksel, int route_j, int route_m,
++    float topp, int normk, float rscale,
++    int *idx, float *w, int *keff, int *true_idx, float *true_w) {
++  if (!g_dev || !g_r_topcachep || !g_rtop8_width_ok || !resident ||
++      S < 1 || E < 1 || E > 256 || K < 1 || Ksel < 1 || Ksel > K ||
++      route_m < Ksel || route_m > 64 || route_m > K*8) return 0;
++  @autoreleasepool {
++    id<MTLBuffer> bs=[g_dev newBufferWithBytes:sig length:(size_t)S*E*4 options:MTLResourceStorageModeShared];
++    id<MTLBuffer> bb=[g_dev newBufferWithBytes:bias length:(size_t)E*4 options:MTLResourceStorageModeShared];
++    id<MTLBuffer> bi=[g_dev newBufferWithLength:(size_t)S*K*4 options:MTLResourceStorageModeShared];
++    id<MTLBuffer> bw=[g_dev newBufferWithLength:(size_t)S*K*4 options:MTLResourceStorageModeShared];
++    id<MTLBuffer> bk=[g_dev newBufferWithLength:(size_t)S*4 options:MTLResourceStorageModeShared];
++    id<MTLBuffer> br=[g_dev newBufferWithBytes:resident length:(size_t)E options:MTLResourceStorageModeShared];
++    id<MTLBuffer> bti=[g_dev newBufferWithLength:(size_t)S*K*4 options:MTLResourceStorageModeShared];
++    id<MTLBuffer> btw=[g_dev newBufferWithLength:(size_t)S*K*4 options:MTLResourceStorageModeShared];
++    if(!bs||!bb||!bi||!bw||!bk||!br||!bti||!btw) return 0;
++    id<MTLCommandBuffer> cb=[g_queue commandBuffer];
++    id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
++    [e setComputePipelineState:g_r_topcachep];
++    [e setBuffer:bs offset:0 atIndex:0]; [e setBuffer:bb offset:0 atIndex:1];
++    [e setBuffer:bi offset:0 atIndex:2]; [e setBuffer:bw offset:0 atIndex:3];
++    [e setBuffer:bk offset:0 atIndex:4];
++    [e setBytes:&E length:4 atIndex:5]; [e setBytes:&K length:4 atIndex:6];
++    [e setBytes:&Ksel length:4 atIndex:7]; [e setBytes:&topp length:4 atIndex:8];
++    [e setBytes:&normk length:4 atIndex:9]; [e setBytes:&rscale length:4 atIndex:10];
++    [e setBuffer:br offset:0 atIndex:11]; [e setBuffer:bti offset:0 atIndex:12];
++    [e setBuffer:btw offset:0 atIndex:13]; [e setBytes:&route_j length:4 atIndex:14];
++    [e setBytes:&route_m length:4 atIndex:15];
++    [e dispatchThreadgroups:MTLSizeMake((NSUInteger)S,1,1)
++         threadsPerThreadgroup:MTLSizeMake(32,1,1)];
++    [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
++    if(cb.status==MTLCommandBufferStatusError){
++      fprintf(stderr,"[metal] cache rtop8 cmdbuf error\n"); return 0; }
++    memcpy(idx,bi.contents,(size_t)S*K*4); memcpy(w,bw.contents,(size_t)S*K*4);
++    memcpy(keff,bk.contents,(size_t)S*4);
++    memcpy(true_idx,bti.contents,(size_t)S*K*4);
++    memcpy(true_w,btw.contents,(size_t)S*K*4);
++  }
++  return 1;
++}
++
+ extern "C" void coli_metal_tensor_free(ColiMetalTensor *t) {
+   if (!t) return;
+   g_tensor_count--; g_tensor_bytes -= t->wbytes;
+diff --git a/c/colibri.c b/c/colibri.c
+index bb24c83..d399030 100644
+--- a/c/colibri.c
++++ b/c/colibri.c
+@@ -75,6 +75,7 @@ static const float *g_pre_sh;
+ /* routing precalcolata dalla GPU (Metal layer CB o device router CUDA, #431):
+  * moe() la usa e salta la FASE A. NULL = router su CPU. */
+ static const int *g_pre_idx; static const float *g_pre_w; static const int *g_pre_keff;
++static const int *g_pre_true_idx; static const float *g_pre_true_w;
+ #ifdef __APPLE__
+ #include <mach/mach.h>                            /* host_statistics64: MemAvailable di macOS */
+ #endif
+@@ -2757,11 +2758,40 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int
+     int pre_routed=0; (void)pre_routed;
+     /* pre-routed shortcut: Metal layer-CB o device router CUDA (#431) — stessa
+      * contabilita' (#417: recency clock incluso), la selezione arriva dalla GPU */
+-    if(g_pre_idx){                               /* routing gia' calcolata dal layer CB (GPU) */
++    if(g_pre_idx && (!g_cache_route || g_pre_true_idx)){
+         memcpy(idxs,g_pre_idx,(size_t)S*K*sizeof(int));
+         memcpy(ws,g_pre_w,(size_t)S*K*sizeof(float));
+         memcpy(keff,g_pre_keff,(size_t)S*sizeof(int));
+         for(int s=0;s<S;s++){
++            if(g_cache_route && g_pre_true_idx){
++                int Ksel=g_topk>0?(g_topk<K?g_topk:K):K;
++                const int *truth=g_pre_true_idx+(int64_t)s*K;
++                const float *truth_w=g_pre_true_w+(int64_t)s*K;
++                const int *selected=idxs+(int64_t)s*K;
++                const float *selected_w=ws+(int64_t)s*K;
++                int overlap=0;
++                m->route_slots+=(uint64_t)Ksel;
++                for(int kk=0;kk<Ksel;kk++){
++                    int in_true=0;
++                    for(int t=0;t<Ksel;t++) if(selected[kk]==truth[t]){ in_true=1; break; }
++                    if(in_true) overlap++; else m->route_swaps++;
++                }
++                m->route_agree_hit+=(uint64_t)overlap;
++                m->route_agree_tot+=(uint64_t)Ksel;
++                float tsum=1e-20f,csum=1e-20f;
++                for(int t=0;t<Ksel;t++) tsum+=truth_w[t]>0?truth_w[t]:0;
++                for(int kk=0;kk<Ksel;kk++) csum+=selected_w[kk]>0?selected_w[kk]:0;
++                double kl=0;
++                for(int t=0;t<Ksel;t++){
++                    double pt=(truth_w[t]>0?truth_w[t]:0)/tsum;
++                    if(pt<=0) continue;
++                    double pc=1e-12;
++                    for(int kk=0;kk<Ksel;kk++) if(selected[kk]==truth[t]){
++                        pc=(selected_w[kk]>0?selected_w[kk]:0)/csum; break; }
++                    kl+=pt*log(pt/pc);
++                }
++                m->route_kl_sum+=kl; m->route_kl_n++;
++            }
+             m->ereq+=keff[s];
+             for(int kk=0;kk<keff[s];kk++){
+                 m->eusage[layer][idxs[(int64_t)s*K+kk]]++;
+@@ -4072,11 +4102,22 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int
+        && c->n_experts==256 && c->topk==8 && c->n_shared==1 && c->moe_inter==2048){
+         int sel_active = m->has_dsa && c->idx_type[li] && (pos_base+S) > c->index_topk;
+         if(!sel_active){
+-            static float *linrm,*lnrm,*lsh,*lw; static int *lidx,*lkeff;
++            static float *linrm,*lnrm,*lsh,*lw,*ltruew; static int *lidx,*lkeff,*ltrueidx;
+             if(!linrm){ linrm=falloc(4*(int64_t)D); lnrm=falloc(4*(int64_t)D); lsh=falloc(4*(int64_t)D);
+-                        lidx=malloc(4*8*sizeof(int)); lw=malloc(4*8*sizeof(float)); lkeff=malloc(4*sizeof(int)); }
++                        lidx=malloc(4*8*sizeof(int)); lw=malloc(4*8*sizeof(float)); lkeff=malloc(4*sizeof(int));
++                        ltrueidx=malloc(4*8*sizeof(int)); ltruew=malloc(4*8*sizeof(float)); }
+             int Ksel = g_topk>0 ? (g_topk<8?g_topk:8) : 8;
+             float tp = (g_topp>0 && g_topp<1.f) ? g_topp : 0.f;
++            static int metal_cache_gate=-1;
++            if(metal_cache_gate<0) metal_cache_gate=getenv("COLI_METAL_CACHE_ROUTE")?
++                atoi(getenv("COLI_METAL_CACHE_ROUTE")):1;
++            int metal_cache=g_cache_route && metal_cache_gate && g_route_p==0 &&
++                g_route_alpha==1.f && tp==0.f && g_route_m>=Ksel && g_route_m<=64;
++            uint8_t resident[256]; const uint8_t *resident_arg=NULL;
++            if(metal_cache){
++                for(int e=0;e<256;e++) resident[e]=(uint8_t)expert_is_resident(m,li,e);
++                resident_arg=resident;
++            }
+             double ta0=now_s();
+             #define WP_(q) ((q).fmt==1?(const void*)(q).q8:(const void*)(q).q4)
+             int ok = coli_metal_layer_decode(x, l->in_ln, l->post_ln,
+@@ -4090,9 +4131,10 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int
+                 WP_(l->sh_down), l->sh_down.s, l->sh_down.fmt,
+                 l->router, l->router_bias,
+                 c->n_experts, c->topk, Ksel, tp, c->norm_topk, c->routed_scale,
++                resident_arg, g_route_j, g_route_m,
+                 m->Lc[li], m->Rc[li], S, pos_base, m->kv_start[li],
+                 c->eps, c->theta, c->attn_scale,
+-                linrm, lnrm, lsh, lidx, lw, lkeff);
++                linrm, lnrm, lsh, lidx, lw, lkeff, ltrueidx, ltruew);
+             #undef WP_
+             if(ok){
+                 m->t_attn += now_s()-ta0;
+@@ -4109,9 +4151,12 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int
+                     la_predict(m,li+1,x,1);
+                     la_predict(m,li+1,x,2);
+                 }
+-                g_pre_idx=lidx; g_pre_w=lw; g_pre_keff=lkeff; g_pre_sh=lsh;
++                if(!g_cache_route||metal_cache){ g_pre_idx=lidx; g_pre_w=lw; g_pre_keff=lkeff; }
++                if(metal_cache){ g_pre_true_idx=ltrueidx; g_pre_true_w=ltruew; }
++                g_pre_sh=lsh;
+                 moe(m,l,li,lnrm,S,tmp,1);
+                 g_pre_idx=NULL; g_pre_w=NULL; g_pre_keff=NULL; g_pre_sh=NULL;
++                g_pre_true_idx=NULL; g_pre_true_w=NULL;
+                 for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
+                 return;
+             }
+diff --git a/c/tests/test_backend_metal.mm b/c/tests/test_backend_metal.mm
+index bff0444..1a4fa33 100644
+--- a/c/tests/test_backend_metal.mm
++++ b/c/tests/test_backend_metal.mm
+@@ -239,6 +239,49 @@ static int run_rtop8(int mode, int S, int E, float topp, int normk, float rscale
+   return 0;
+ }
+
++static int run_cache_rtop8(int route_m, const char *name) {
++  const int S=4,E=256,K=8,Ksel=8,J=2;
++  std::vector<float> sig((size_t)S*E),bias(E);
++  std::vector<uint8_t> resident(E);
++  for(int e=0;e<E;e++){ bias[e]=(float)((e*17)%37)/1000.f; resident[e]=(e%5)==0; }
++  for(int s=0;s<S;s++) for(int e=0;e<E;e++)
++    sig[(size_t)s*E+e]=(float)(((e*73+s*41)%997)+1)/1000.f;
++  std::vector<int> gi((size_t)S*K),gk(S),gti((size_t)S*K);
++  std::vector<float> gw((size_t)S*K),gtw((size_t)S*K);
++  if(!coli_metal_rtop8_cache(sig.data(),bias.data(),resident.data(),S,E,K,Ksel,J,route_m,
++                             0.f,1,1.f,gi.data(),gw.data(),gk.data(),gti.data(),gtw.data())){
++    printf("  %-34s FAIL (cache rtop8 runner returned 0)\n",name); return 1; }
++  int ok=1,changed=0;
++  for(int s=0;s<S;s++){
++    std::vector<int> rank(route_m),used(E,0),ref;
++    for(int r=0;r<route_m;r++){
++      float bv=-1e30f; int bi=0x7fffffff;
++      for(int e=0;e<E;e++) if(!used[e]){
++        float v=sig[(size_t)s*E+e]+bias[e];
++        if(v>bv||(v==bv&&e<bi)){ bv=v; bi=e; }
++      }
++      rank[r]=bi; used[bi]=1;
++    }
++    for(int r=0;r<J;r++) ref.push_back(rank[r]);
++    for(int r=J;r<route_m&&(int)ref.size()<Ksel;r++) if(resident[rank[r]]) ref.push_back(rank[r]);
++    for(int r=0;r<route_m&&(int)ref.size()<Ksel;r++){
++      int dup=0; for(int e:ref) if(e==rank[r]) dup=1;
++      if(!dup) ref.push_back(rank[r]);
++    }
++    float sum=0; for(int k=0;k<Ksel;k++) sum+=sig[(size_t)s*E+ref[k]];
++    for(int k=0;k<Ksel;k++){
++      if(gi[(size_t)s*K+k]!=ref[k] || gti[(size_t)s*K+k]!=rank[k] ||
++         fabsf(gw[(size_t)s*K+k]-sig[(size_t)s*E+ref[k]]/sum)>2e-7f ||
++         gtw[(size_t)s*K+k]!=sig[(size_t)s*E+rank[k]]) ok=0;
++      if(ref[k]!=rank[k]) changed=1;
++    }
++    if(gk[s]!=Ksel) ok=0;
++  }
++  ok=ok&&changed;
++  printf("  %-34s %s\n",name,ok?"ok (GPU==CPU reference)":"*** MISMATCH");
++  return ok?0:1;
++}
++
+ int main(void) {
+   if (!coli_metal_init()) { printf("Metal unavailable (skipping)\n"); return 0; }
+   printf("Metal backend kernel tests:\n");
+@@ -303,6 +346,9 @@ int main(void) {
+   // reading (both kernels agree bitwise on a selection that requires that check to fire).
+   fail |= run_rtop8(5, 4, 200, 0.0f,  1, 1.0f,   "top8 E=200 (lane straddles E boundary)");
+   fail |= run_rtop8(0, 1, 257, 0.0f,  1, 1.0f,   "top8 E=257 (>256, auto-serial-fallback)");
++  printf("Metal cache-aware top-8 tests (experimental route):\n");
++  fail |= run_cache_rtop8(12, "cache top8 J=2 M=12");
++  fail |= run_cache_rtop8(32, "cache top8 J=2 M=32");
+   printf(fail? "metal backend tests: FAILED\n" : "metal backend tests: ok\n");
+   coli_metal_shutdown();
+   return fail;

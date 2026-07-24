@@ -2,6 +2,10 @@
 
 Date: 2026-07-23
 
+> Historical note: this report covers the first LargerLM-native cache path.
+> The active Colibri runtime and July 24 results supersede its final decision;
+> see [Colibri M5 Max Optimization](colibri-m5-optimization.md).
+
 ## Final Status
 
 The Colibri hypothesis was tested with real GLM-5.2 MXFP4 weights on the target

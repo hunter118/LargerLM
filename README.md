@@ -1,77 +1,72 @@
 # LargerLM
 
-LargerLM is a proof-of-feasibility Apple Silicon runtime for GLM-style MoE
-models larger than unified memory. It combines SSD-backed expert streaming,
-bounded Metal execution, M5 prefill acceleration, and strict memory admission.
+Proof-of-feasibility GLM-5.2 inference on an Apple M5 Max with 128 GB unified
+memory. The active runtime is a guarded, M5-tuned
+[Colibri](https://github.com/JustVugg/colibri) build that streams routed experts
+from the internal SSD.
 
-It is not a production inference engine.
+This is experimental research code, not a production inference engine.
 
-## Status
+## Current Result
 
-Real GLM-5.2 MXFP4 generation now works on an M5 Max with 128 GB unified
-memory. A learned 10 GiB expert set improved held-out steady decode from
-`0.858` to `1.083 tok/s` while preserving generated tokens and a 24 GiB system
-memory reserve. The best evidence-backed context=1 projection is `1.427 tok/s`,
-well below the `5 tok/s` continuation gate, so the project is sealed at a
-minimum runnable version.
+| Mode | Decode | Routing | Peak RSS |
+| --- | ---: | --- | ---: |
+| `quality` | `2.69 tok/s` over 256 tokens | Original GLM top-8 | `96.95 GiB` |
+| `experimental-fast` | `4.92 tok/s` over 64 tokens | Cache-aware `J=2, M=32` | `96.31 GiB` |
 
-The detailed measurements and the rejected 80 GiB cache experiment are in
-[GLM-5.2 MXFP4 validation](docs/real-glm-validation.md).
+The fast mode reached `5.21 tok/s` over its first 32 tokens on the
+power-constrained test machine. It changes about 35% of routed expert slots and
+is not output-equivalent to the original model. The quality mode is the default.
 
 ## Requirements
 
-- Apple M5 Max with 128 GB unified memory for the validated profile.
-- macOS 26 with Metal 4.
-- Fast internal SSD and about 400 GB for a prepared GLM-5.2 package.
-- Python 3.9+ and the local Metal build tools.
+- Apple M5 Max with 128 GB unified memory.
+- macOS 26, Xcode command-line tools, and the fast internal SSD.
+- About 400 GB free for the 357 GB Colibri GLM-5.2 package.
+- At least 24 GiB reclaimable memory before launch.
 
-Weights and generated artifacts are excluded from Git.
+## Setup
 
-## Quick Start
+Build the pinned Colibri revision and apply the tested M5 patch:
 
 ```bash
+./scripts/setup_colibri_m5.sh
 python3 -m venv .venv
 . .venv/bin/activate
 python3 -m pip install -e .
-make -C metal
 ```
 
-Generate with an existing prepared package:
+Download the supported model:
 
 ```bash
-python3 -m largerlm generate-metal-token-ids \
-  artifacts/glm-5.2-mxfp4/largerlm-prepared \
-  --expert-pin-plan expert-pin-plan.json \
-  --prompt-token-ids 150000 \
-  --max-new-tokens 8 \
-  --mmap-final-logits \
-  --cache-mla-kv-b-f32 \
-  --max-mla-kv-b-cache-mib 4608 \
-  --max-live-working-set-mib 16384 \
-  --min-free-unified-memory-gib 24
+hf download mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp \
+  --local-dir artifacts/colibri-glm5.2-int4
 ```
 
-Build the measured M5 Max expert plan from route telemetry:
+Run with the original model routing:
 
 ```bash
-python3 scripts/expert_usage_plan.py route-generated.json \
-  --expert-layout artifacts/glm-5.2-mxfp4/largerlm-prepared/experts/layout.json \
-  --m5-max-128g-safe \
-  --write-profile expert-usage-profile.json \
-  --write-plan expert-pin-plan.json
+.venv/bin/python scripts/run_colibri_m5.py \
+  "请用三点解释量子纠缠为什么不能用于超光速通信。" \
+  --ngen 64 --profile
 ```
 
-The safe profile pins at most 10 GiB and leaves the remaining reusable expert
-pages to macOS. Do not raise the live cap merely because physical unified
-memory is available.
+Opt in to the experimental approximately 5 tok/s route:
+
+```bash
+.venv/bin/python scripts/run_colibri_m5.py \
+  "请用三点解释量子纠缠为什么不能用于超光速通信。" \
+  --mode experimental-fast --ngen 64 --profile
+```
+
+The launcher refuses unsafe starts and terminates Colibri before process-group
+RSS exceeds 105 GiB or macOS memory pressure falls below 10% free. Do not bypass
+these guards on a 128 GB machine.
 
 ## Documentation
 
-- [Validation report](docs/real-glm-validation.md)
-- [Proof-of-feasibility guide](docs/proof-of-feasibility-guide.md)
-- [Minimum runnable seal](docs/minimal-usable-seal.md)
-- [Colibri hot-expert analysis](docs/colibri-hot-expert-notes.md)
-- [Flash-MoE rewrite decision](docs/flash-moe-rewrite-decision.md)
+- [M5 optimization and usage guide](docs/colibri-m5-optimization.md)
+- [Real GLM validation history](docs/real-glm-validation.md)
 - [Architecture](docs/architecture.md)
 - [Development log](docs/development-log.md)
 
@@ -79,4 +74,5 @@ memory is available.
 
 ```bash
 .venv/bin/python -m pytest -q
+make -C third_party/colibri/c metal-test
 ```
