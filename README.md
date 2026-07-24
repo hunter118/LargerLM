@@ -13,7 +13,7 @@ This is experimental research code, not a production inference engine.
 | --- | ---: | --- | ---: |
 | `quality` | `2.69 tok/s` over 256 tokens | Original GLM top-8 | `96.95 GiB` |
 | `experimental-fast` | `4.92 tok/s` over 64 tokens | Cache-aware `J=2, M=32` | `96.31 GiB` |
-| `experimental-fast` Web | `5.31 tok/s` over 64 tokens | Single-slot persistent API | about `97 GiB` |
+| `experimental-fast` Web (32K) | `5.48 tok/s` over 64 tokens | Single-slot persistent API | about `97 GiB` |
 
 The fast mode reached `5.21 tok/s` over its first 32 tokens on the
 power-constrained test machine. It changes about 35% of routed expert slots and
@@ -63,6 +63,7 @@ its memory with:
 
 The UI is persistent between questions. Its headline speed includes prefill and
 time to first token; the Performance view reports decode throughput separately.
+The guarded Web profile provides a 32,768-token total context and output cap.
 
 Run with the original model routing:
 

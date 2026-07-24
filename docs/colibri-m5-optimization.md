@@ -105,21 +105,21 @@ case. It binds that slot's KV cache and uses the same contiguous decode step as
 the command-line path. Multi-user and multi-slot requests retain Colibri's
 original ragged batching behavior.
 
-A real 26-token Chinese prompt followed by 64 generated tokens measured:
+A real 26-token Chinese prompt followed by 64 generated tokens measured after
+raising the Web context from 4K to 32K:
 
 | Metric | Result |
 | --- | ---: |
-| Decode throughput | `5.31 tok/s` |
-| Decode wall time | `12.063 s` |
-| UI end-to-end rate | `3.6 tok/s` |
-| Time to first token | `5.6 s` |
-| Expert disk service | `6.009 s` |
-| Expert I/O wait | `4.219 s` |
-| Expert matmul | `3.714 s` |
-| Attention | `3.534 s` |
+| Decode throughput | `5.48 tok/s` |
+| Decode wall time | `11.674 s` |
+| Expert disk service | `6.798 s` |
+| Expert I/O wait | `4.716 s` |
+| Expert matmul | `3.250 s` |
+| Attention | `3.208 s` |
+| Resident experts after warmup | `4,448` / `84.14 GB` |
 
-The UI rate includes prompt prefill and first-token latency; it is not directly
-comparable to decode-only measurements. The server is intentionally configured
+End-to-end UI rates also include prompt prefill and first-token latency, so they
+are lower than decode-only measurements. The server is intentionally configured
 with one KV slot and one queued request because this machine is optimized for
 one interactive user and because additional simultaneous contexts increase
 memory risk.
@@ -214,14 +214,22 @@ Start a persistent, guarded model process:
 
 ```bash
 .venv/bin/python scripts/run_colibri_m5.py \
-  --web --detach --mode experimental-fast --ngen 512 \
+  --web --detach --mode experimental-fast --ctx 32768 --ngen 32768 \
   --profile --preserve-usage --sample-seconds 1
 ```
 
 Open `http://127.0.0.1:8000`. The launcher only accepts loopback addresses, sets
 one KV slot and one request queue slot, and keeps the model loaded across
-questions. The browser's maximum-output control limits each answer; `128` is a
-reasonable interactive starting point.
+questions. The browser reads the server's output limit from `/health` instead
+of imposing its former hard-coded 4,096-token ceiling. The M5 Web default is a
+32,768-token total context and output cap; prompt and conversation history also
+consume that context, so the server clips generation to the remaining room.
+
+At 32K, the KV pool and maximum-context attention workspace reserve about
+9.7 GB, roughly 8.5 GB more than the old 4K profile. Colibri compensates by
+reducing its per-layer LRU expert capacity. A 64K context would reserve about
+19.4 GB and materially erode expert residency and decode speed, while the
+model's nominal 1M context would not fit this 128 GB machine.
 
 Stop the complete guarded process group and release about 97 GiB:
 

@@ -21,6 +21,9 @@ M5_MAX_PIN_GIB = 46
 M5_MAX_RSS_GIB = 105
 M5_MIN_START_AVAILABLE_GIB = 24
 M5_MIN_PRESSURE_FREE_PERCENT = 10
+M5_RUN_CONTEXT_TOKENS = 4096
+M5_WEB_CONTEXT_TOKENS = 32768
+M5_MAX_CONTEXT_TOKENS = 32768
 QUALITY_MODE = "quality"
 EXPERIMENTAL_FAST_MODE = "experimental-fast"
 LAUNCH_MODES = (QUALITY_MODE, EXPERIMENTAL_FAST_MODE)
@@ -50,6 +53,7 @@ class LaunchConfig:
     ram_gib: int = M5_MAX_RAM_GIB
     pin_gib: int = M5_MAX_PIN_GIB
     ngen: int = 64
+    context_tokens: int = M5_RUN_CONTEXT_TOKENS
     temperature: float = 0.0
     profile: bool = False
     mode: str = QUALITY_MODE
@@ -148,6 +152,13 @@ def validate_launch(config: LaunchConfig) -> None:
         raise ColibriM5Error("pin_gib must be smaller than ram_gib")
     if config.ngen <= 0:
         raise ColibriM5Error("ngen must be positive")
+    if not 1 <= config.context_tokens <= M5_MAX_CONTEXT_TOKENS:
+        raise ColibriM5Error(
+            f"context_tokens must be in [1, {M5_MAX_CONTEXT_TOKENS}] "
+            "for the safe M5 profile"
+        )
+    if config.ngen > config.context_tokens:
+        raise ColibriM5Error("ngen must not exceed context_tokens")
     if config.interface not in LAUNCH_INTERFACES:
         raise ColibriM5Error(
             f"interface must be one of: {', '.join(LAUNCH_INTERFACES)}"
@@ -189,6 +200,7 @@ def colibri_environment(
             "KVSAVE": "0",
             "COLI_KV_SLOTS": "1",
             "COLI_MAX_QUEUE": "1",
+            "CTX": str(config.context_tokens),
             "MTP": "0",
             "PILOT": "0",
             "PILOT_REAL": "0",
@@ -224,6 +236,8 @@ def colibri_command(config: LaunchConfig) -> list[str]:
             str(config.model),
             "--ram",
             str(config.ram_gib),
+            "--ctx",
+            str(config.context_tokens),
             "--ngen",
             str(config.ngen),
             "--temp",
@@ -246,6 +260,8 @@ def colibri_command(config: LaunchConfig) -> list[str]:
         str(config.model),
         "--ram",
         str(config.ram_gib),
+        "--ctx",
+        str(config.context_tokens),
         "--ngen",
         str(config.ngen),
         "--temp",
@@ -515,7 +531,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=default_usage_profile,
     )
-    parser.add_argument("--ngen", type=int, default=64)
+    parser.add_argument(
+        "--ngen",
+        type=int,
+        help="maximum generated tokens (Web default: 32768; one-shot default: 64)",
+    )
+    parser.add_argument(
+        "--ctx",
+        type=int,
+        help="total KV context tokens (Web default: 32768; one-shot default: 4096)",
+    )
     parser.add_argument("--ram-gib", type=int, default=M5_MAX_RAM_GIB)
     parser.add_argument("--pin-gib", type=int, default=M5_MAX_PIN_GIB)
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -587,6 +612,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"run_colibri_m5: {exc}", file=sys.stderr)
             return 2
     usage_profile = args.usage_profile or args.model / ".coli_usage"
+    web_interface = bool(args.web)
+    default_context = (
+        M5_WEB_CONTEXT_TOKENS if web_interface else M5_RUN_CONTEXT_TOKENS
+    )
+    default_ngen = M5_WEB_CONTEXT_TOKENS if web_interface else 64
+    context_tokens = args.ctx if args.ctx is not None else default_context
+    ngen = args.ngen if args.ngen is not None else default_ngen
     config = LaunchConfig(
         engine=args.engine.expanduser().resolve(),
         model=args.model.expanduser().resolve(),
@@ -594,11 +626,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         usage_profile=usage_profile.expanduser().resolve(),
         ram_gib=args.ram_gib,
         pin_gib=args.pin_gib,
-        ngen=args.ngen,
+        ngen=ngen,
+        context_tokens=context_tokens,
         temperature=args.temperature,
         profile=args.profile,
         mode=args.mode,
-        interface=WEB_INTERFACE if args.web else RUN_INTERFACE,
+        interface=WEB_INTERFACE if web_interface else RUN_INTERFACE,
         host=args.host,
         port=args.port,
     )

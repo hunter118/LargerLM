@@ -70,6 +70,7 @@ def test_colibri_m5_environment_enables_measured_fast_path(tmp_path: Path) -> No
     assert env["COLI_METAL_CACHE_ROUTE"] == "0"
     assert env["COLI_KV_SLOTS"] == "1"
     assert env["COLI_MAX_QUEUE"] == "1"
+    assert env["CTX"] == "4096"
     assert env["DIRECT"] == "1"
     assert env["PIPE_WORKERS"] == "8"
     assert env["MTP"] == "0"
@@ -113,6 +114,8 @@ def test_colibri_command_is_quality_preserving_greedy_profile(
         str(config.model),
         "--ram",
         "110",
+        "--ctx",
+        "4096",
         "--ngen",
         "256",
         "--temp",
@@ -129,6 +132,7 @@ def test_colibri_web_command_uses_single_slot_loopback_server(
         interface="web",
         port=8123,
         ngen=512,
+        context_tokens=32768,
     )
     web_dist = config.engine.parent.parent / "web/dist"
     web_dist.mkdir(parents=True)
@@ -141,6 +145,8 @@ def test_colibri_web_command_uses_single_slot_loopback_server(
         str(config.model),
         "--ram",
         "110",
+        "--ctx",
+        "32768",
         "--ngen",
         "512",
         "--temp",
@@ -164,6 +170,8 @@ def test_colibri_web_command_uses_single_slot_loopback_server(
         ({"pin_gib": 47}, "pin_gib"),
         ({"ram_gib": 40, "pin_gib": 40}, "smaller"),
         ({"ngen": 0}, "ngen"),
+        ({"context_tokens": 32769}, "context_tokens"),
+        ({"ngen": 4097, "context_tokens": 4096}, "context_tokens"),
         ({"prompt": "  "}, "prompt"),
         ({"mode": "turbo"}, "mode"),
         ({"interface": "desktop"}, "interface"),

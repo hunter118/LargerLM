@@ -367,6 +367,55 @@ index bb24c83..7196765 100644
          m->n_fw++;
          if(g_prof) prof_lat(now_s()-tf0);
          for(int s=0;s<S;s++){
+diff --git a/c/openai_server.py b/c/openai_server.py
+index 6b8632d..3873bc6 100644
+--- a/c/openai_server.py
++++ b/c/openai_server.py
+@@ -974,12 +974,13 @@ class APIServer(ThreadingHTTPServer):
+
+     def __init__(self, address, engine, model_id, api_key=None, max_tokens=1024,
+                  cors_origins=DEFAULT_CORS_ORIGINS, max_queue=8, queue_timeout=300,
+-                 kv_slots=1):
++                 kv_slots=1, context_tokens=4096):
+         super().__init__(address, APIHandler)
+         self.engine = engine
+         self.model_id = model_id
+         self.api_key = api_key
+         self.max_tokens = max_tokens
++        self.context_tokens = context_tokens
+         self.scheduler = GenerationScheduler(max_queue, queue_timeout, kv_slots)
+         self.kv_slots = kv_slots
+         self.cors_origins = tuple(cors_origins)
+@@ -1126,6 +1127,10 @@ class APIHandler(BaseHTTPRequestHandler):
+                 if self._is_authed():
+                     payload["scheduler"] = self.server.scheduler.snapshot()
+                     payload["kv_slots"] = self.server.kv_slots
++                    payload["limits"] = {
++                        "max_completion_tokens": self.server.max_tokens,
++                        "context_tokens": self.server.context_tokens,
++                    }
+                     tiers = getattr(self.server.engine, "tiers", None) if self.server.engine else None
+                     if tiers: payload["tiers"] = tiers
+                     hwinfo = getattr(self.server.engine, "hwinfo", None) if self.server.engine else None
+@@ -1638,6 +1643,9 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
+         raise ValueError("queue_timeout must be positive")
+     if not 1 <= kv_slots <= 16:
+         raise ValueError("kv_slots must be between 1 and 16")
++    context_tokens = int((env or os.environ).get("CTX", "4096"))
++    if context_tokens < 1:
++        raise ValueError("CTX must be positive")
+     if host not in ("127.0.0.1", "localhost", "::1") and not api_key:
+         # (#SEC-6) Fail closed: an unauthenticated engine on a non-loopback bind exposes
+         # a compute-heavy API to the network. Refuse unless explicitly overridden.
+@@ -1652,7 +1660,7 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
+     # Bind before starting the 744B engine. A stale/occupied port must fail in
+     # milliseconds rather than loading hundreds of GB and leaking a child.
+     server = APIServer((host, port), None, model_id, api_key, max_tokens, origins,
+-                       max_queue, queue_timeout, kv_slots)
++                       max_queue, queue_timeout, kv_slots, context_tokens)
+     runtime = None
+     previous_sigterm = signal.getsignal(signal.SIGTERM)
+     try:
 diff --git a/c/tests/test_backend_metal.mm b/c/tests/test_backend_metal.mm
 index bff0444..1a4fa33 100644
 --- a/c/tests/test_backend_metal.mm
@@ -431,3 +480,82 @@ index bff0444..1a4fa33 100644
    printf(fail? "metal backend tests: FAILED\n" : "metal backend tests: ok\n");
    coli_metal_shutdown();
    return fail;
+diff --git a/c/tests/test_openai_server.py b/c/tests/test_openai_server.py
+index 98da4c1..1d23c10 100644
+--- a/c/tests/test_openai_server.py
++++ b/c/tests/test_openai_server.py
+@@ -451,7 +451,15 @@ class HTTPTest(unittest.TestCase):
+     @classmethod
+     def setUpClass(cls):
+         cls.engine = FakeEngine()
+-        cls.server = APIServer(("127.0.0.1", 0),cls.engine,"test-model","secret",16,kv_slots=2)
++        cls.server = APIServer(
++            ("127.0.0.1", 0),
++            cls.engine,
++            "test-model",
++            "secret",
++            16,
++            kv_slots=2,
++            context_tokens=8192,
++        )
+         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+         cls.thread.start()
+         cls.base = f"http://127.0.0.1:{cls.server.server_port}"
+@@ -485,6 +493,10 @@ class HTTPTest(unittest.TestCase):
+         self.assertEqual(scheduler["max_queue"], 8)
+         self.assertIn("queued", scheduler)
+         self.assertEqual(health["kv_slots"], 2)
++        self.assertEqual(
++            health["limits"],
++            {"max_completion_tokens": 16, "context_tokens": 8192},
++        )
+
+     def test_profile_reports_recent_turns_without_auth(self):
+         with urlopen(self.base + "/profile", timeout=2) as response:
+diff --git a/web/src/App.tsx b/web/src/App.tsx
+index 39c9f3b..64408d7 100644
+--- a/web/src/App.tsx
++++ b/web/src/App.tsx
+@@ -81,6 +81,7 @@ export default function App() {
+   const bottomRef = useRef<HTMLDivElement>(null)
+   const messages = conversations[cacheSlot] || []
+   const kvSlots = Math.max(1, health?.kv_slots || 1)
++  const maxOutputTokens = Math.max(1, health?.limits?.max_completion_tokens || 32768)
+   const active = activeRequests(health)
+   const capacity = health?.scheduler?.capacity || kvSlots
+   const failures = health?.scheduler ? health.scheduler.rejected + health.scheduler.timed_out + health.scheduler.cancelled : 0
+@@ -96,6 +97,10 @@ export default function App() {
+     persistPublicSettings(localStorage, baseUrl, model)
+   }, [baseUrl, model])
+
++  useEffect(() => {
++    setMaxTokens((value) => Math.min(value, maxOutputTokens))
++  }, [maxOutputTokens])
++
+   // EFFECT #2
+   useEffect(() => {
+     setConnected(false)
+@@ -299,7 +304,7 @@ export default function App() {
+             {Array.from({ length: kvSlots }, (_, slot) => <option key={slot} value={slot}>{t("sidebar.sessionLabel", { slot: slot + 1 })}</option>)}
+           </select><span className="field-help">{t("sidebar.kvSessionHelp")}</span></label> : null}
+           <label><span className="label-line"><span>{t("sidebar.temperature")}</span><code>{temperature.toFixed(1)}</code></span><input className="range" type="range" min="0" max="2" step="0.1" value={temperature} onChange={(event) => setTemperature(Number(event.target.value))} /></label>
+-          <label>{t("sidebar.maxTokens")}<Input type="number" min={1} max={4096} value={maxTokens} onChange={(event) => { const value = Number(event.target.value); if (Number.isFinite(value)) setMaxTokens(Math.min(4096, Math.max(1, Math.round(value)))) }} /></label>
++          <label>{t("sidebar.maxTokens")}<Input type="number" min={1} max={maxOutputTokens} value={maxTokens} onChange={(event) => { const value = Number(event.target.value); if (Number.isFinite(value)) setMaxTokens(Math.min(maxOutputTokens, Math.max(1, Math.round(value)))) }} /></label>
+           <button type="button" className={cn("toggle-row", thinking && "active")} aria-pressed={thinking} onClick={() => setThinking((value) => !value)}>
+             <span><BrainCircuit className="size-4" /> {t("sidebar.reasoning")}</span><i><b /></i>
+           </button>
+diff --git a/web/src/lib/api.ts b/web/src/lib/api.ts
+index 11bb9c5..eae1a30 100644
+--- a/web/src/lib/api.ts
++++ b/web/src/lib/api.ts
+@@ -45,6 +45,10 @@ export interface HealthResponse {
+   status: string
+   scheduler?: SchedulerHealth
+   kv_slots?: number
++  limits?: {
++    max_completion_tokens: number
++    context_tokens: number
++  }
+   tiers?: TiersHealth
+   hwinfo?: HwinfoHealth
+ }
