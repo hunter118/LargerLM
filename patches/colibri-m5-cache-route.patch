@@ -244,7 +244,7 @@ index 6ec3fb4..839694e 100644
    if (!t) return;
    g_tensor_count--; g_tensor_bytes -= t->wbytes;
 diff --git a/c/colibri.c b/c/colibri.c
-index bb24c83..d399030 100644
+index bb24c83..7196765 100644
 --- a/c/colibri.c
 +++ b/c/colibri.c
 @@ -75,6 +75,7 @@ static const float *g_pre_sh;
@@ -348,6 +348,25 @@ index bb24c83..d399030 100644
                  for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
                  return;
              }
+@@ -5498,7 +5543,17 @@ static void run_serve_mux(Model *m, const char *snap){
+         }
+         if(S==0) continue;               /* every active slot drafted this round */
+         double tf0=g_prof?now_s():0;
+-        float *lo=step_decode_batch(m,rows,S); if(!lo){fprintf(stderr,"decode batch failed\n");break;}
++        float *lo;
++        if(S==1 && nctx==1){
++            /* A one-slot API has no ragged batch to amortize. Rebind its KV and use
++             * the normal contiguous path so full-layer Metal remains available. */
++            int i=slots[0]; ServeCtx *sc=&ctx[i]; ServeReq *r=&req[i];
++            kv_bind(m,&sc->kv);
++            lo=step(m,&r->pending,1,sc->len);
++        } else {
++            lo=step_decode_batch(m,rows,S);
++        }
++        if(!lo){fprintf(stderr,"decode batch failed\n");break;}
+         m->n_fw++;
+         if(g_prof) prof_lat(now_s()-tf0);
+         for(int s=0;s<S;s++){
 diff --git a/c/tests/test_backend_metal.mm b/c/tests/test_backend_metal.mm
 index bff0444..1a4fa33 100644
 --- a/c/tests/test_backend_metal.mm

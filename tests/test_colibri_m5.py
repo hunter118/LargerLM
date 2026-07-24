@@ -18,7 +18,9 @@ from largerlm.colibri_m5 import (
 
 
 def _config(tmp_path: Path, **overrides: object) -> LaunchConfig:
-    engine = tmp_path / "coli"
+    engine_dir = tmp_path / "c"
+    engine_dir.mkdir()
+    engine = engine_dir / "coli"
     engine.write_text("#!/bin/sh\n", encoding="ascii")
     engine.chmod(0o755)
     model = tmp_path / "model"
@@ -66,6 +68,8 @@ def test_colibri_m5_environment_enables_measured_fast_path(tmp_path: Path) -> No
     assert env["COLI_METAL_RESSET"] == "1"
     assert env["CACHE_ROUTE"] == "0"
     assert env["COLI_METAL_CACHE_ROUTE"] == "0"
+    assert env["COLI_KV_SLOTS"] == "1"
+    assert env["COLI_MAX_QUEUE"] == "1"
     assert env["DIRECT"] == "1"
     assert env["PIPE_WORKERS"] == "8"
     assert env["MTP"] == "0"
@@ -116,6 +120,43 @@ def test_colibri_command_is_quality_preserving_greedy_profile(
     ]
 
 
+def test_colibri_web_command_uses_single_slot_loopback_server(
+    tmp_path: Path,
+) -> None:
+    config = _config(
+        tmp_path,
+        prompt="",
+        interface="web",
+        port=8123,
+        ngen=512,
+    )
+    web_dist = config.engine.parent.parent / "web/dist"
+    web_dist.mkdir(parents=True)
+    (web_dist / "index.html").write_text("<html></html>", encoding="ascii")
+
+    assert colibri_command(config) == [
+        str(config.engine),
+        "web",
+        "--model",
+        str(config.model),
+        "--ram",
+        "110",
+        "--ngen",
+        "512",
+        "--temp",
+        "0.0",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8123",
+        "--kv-slots",
+        "1",
+        "--max-queue",
+        "1",
+        "--no-browser",
+    ]
+
+
 @pytest.mark.parametrize(
     ("overrides", "message"),
     (
@@ -125,6 +166,11 @@ def test_colibri_command_is_quality_preserving_greedy_profile(
         ({"ngen": 0}, "ngen"),
         ({"prompt": "  "}, "prompt"),
         ({"mode": "turbo"}, "mode"),
+        ({"interface": "desktop"}, "interface"),
+        (
+            {"prompt": "", "interface": "web", "host": "0.0.0.0"},
+            "loopback",
+        ),
     ),
 )
 def test_validate_launch_rejects_unsafe_profile(

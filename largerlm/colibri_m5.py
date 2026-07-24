@@ -24,6 +24,10 @@ M5_MIN_PRESSURE_FREE_PERCENT = 10
 QUALITY_MODE = "quality"
 EXPERIMENTAL_FAST_MODE = "experimental-fast"
 LAUNCH_MODES = (QUALITY_MODE, EXPERIMENTAL_FAST_MODE)
+RUN_INTERFACE = "run"
+WEB_INTERFACE = "web"
+LAUNCH_INTERFACES = (RUN_INTERFACE, WEB_INTERFACE)
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 
 
 class ColibriM5Error(RuntimeError):
@@ -49,6 +53,9 @@ class LaunchConfig:
     temperature: float = 0.0
     profile: bool = False
     mode: str = QUALITY_MODE
+    interface: str = RUN_INTERFACE
+    host: str = "127.0.0.1"
+    port: int = 8000
 
 
 def parse_vm_stat_available_bytes(output: str) -> int:
@@ -141,8 +148,24 @@ def validate_launch(config: LaunchConfig) -> None:
         raise ColibriM5Error("pin_gib must be smaller than ram_gib")
     if config.ngen <= 0:
         raise ColibriM5Error("ngen must be positive")
-    if not config.prompt.strip():
+    if config.interface not in LAUNCH_INTERFACES:
+        raise ColibriM5Error(
+            f"interface must be one of: {', '.join(LAUNCH_INTERFACES)}"
+        )
+    if config.interface == RUN_INTERFACE and not config.prompt.strip():
         raise ColibriM5Error("prompt must not be empty")
+    if config.interface == WEB_INTERFACE:
+        if config.host not in LOOPBACK_HOSTS:
+            raise ColibriM5Error(
+                "the guarded web profile only binds to a loopback address"
+            )
+        if not 1 <= config.port <= 65535:
+            raise ColibriM5Error("port must be in [1, 65535]")
+        web_index = config.engine.parent.parent / "web/dist/index.html"
+        if not web_index.is_file():
+            raise ColibriM5Error(
+                f"Colibri web UI is not built: {web_index}"
+            )
     if config.mode not in LAUNCH_MODES:
         raise ColibriM5Error(
             f"mode must be one of: {', '.join(LAUNCH_MODES)}"
@@ -164,6 +187,8 @@ def colibri_environment(
             "COLI_NO_OMP_TUNE": "1",
             "DIRECT": "1",
             "KVSAVE": "0",
+            "COLI_KV_SLOTS": "1",
+            "COLI_MAX_QUEUE": "1",
             "MTP": "0",
             "PILOT": "0",
             "PILOT_REAL": "0",
@@ -191,6 +216,28 @@ def colibri_environment(
 
 
 def colibri_command(config: LaunchConfig) -> list[str]:
+    if config.interface == WEB_INTERFACE:
+        return [
+            str(config.engine),
+            "web",
+            "--model",
+            str(config.model),
+            "--ram",
+            str(config.ram_gib),
+            "--ngen",
+            str(config.ngen),
+            "--temp",
+            str(config.temperature),
+            "--host",
+            config.host,
+            "--port",
+            str(config.port),
+            "--kv-slots",
+            "1",
+            "--max-queue",
+            "1",
+            "--no-browser",
+        ]
     return [
         str(config.engine),
         "run",
@@ -277,6 +324,16 @@ def run_guarded(
     peak_rss = 0
     minimum_pressure_free = 100
     guard_reason: str | None = None
+    stop_signal = 0
+
+    def request_stop(signum: int, _frame: object) -> None:
+        nonlocal stop_signal
+        stop_signal = signum
+
+    previous_handlers = {
+        signum: signal.signal(signum, request_stop)
+        for signum in (signal.SIGINT, signal.SIGTERM)
+    }
     try:
         print(
             "[LargerLM guard] "
@@ -299,6 +356,10 @@ def run_guarded(
         )
         while process.poll() is None:
             time.sleep(sample_seconds)
+            if stop_signal:
+                guard_reason = f"received signal {stop_signal}"
+                _stop_process_group(process, guard_reason)
+                break
             rss = process_group_rss_bytes(process.pid)
             pressure_free = memory_pressure_free_percent()
             peak_rss = max(peak_rss, rss)
@@ -329,6 +390,8 @@ def run_guarded(
                 usage_path.unlink()
         if backup_dir is not None:
             backup_dir.cleanup()
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
 
     print(
         "[LargerLM guard] "
@@ -337,9 +400,82 @@ def run_guarded(
         f"exit={return_code}",
         file=sys.stderr,
     )
-    if guard_reason is not None:
+    if guard_reason is not None and not stop_signal:
         raise ColibriM5Error(guard_reason)
-    return return_code
+    return 0 if stop_signal else return_code
+
+
+def _guard_process_command(pid: int) -> str:
+    result = subprocess.run(
+        ["/bin/ps", "-p", str(pid), "-o", "command="],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def start_detached_web(
+    argv: Sequence[str],
+    *,
+    pid_file: Path,
+    log_file: Path,
+) -> int:
+    if pid_file.exists():
+        try:
+            old_pid = int(pid_file.read_text(encoding="ascii").strip())
+        except (OSError, ValueError):
+            old_pid = 0
+        if old_pid > 0 and _guard_process_command(old_pid):
+            raise ColibriM5Error(
+                f"guarded Colibri web process is already running: PID {old_pid}"
+            )
+        pid_file.unlink(missing_ok=True)
+
+    child_argv = [argument for argument in argv if argument != "--detach"]
+    launcher = Path(sys.argv[0]).expanduser().resolve()
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    with log_file.open("ab") as log:
+        process = subprocess.Popen(
+            [sys.executable, str(launcher), *child_argv],
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
+        )
+    pid_file.write_text(f"{process.pid}\n", encoding="ascii")
+    print(
+        f"guarded Colibri web monitor started: PID {process.pid}\n"
+        f"log: {log_file}"
+    )
+    return 0
+
+
+def stop_detached_web(pid_file: Path, timeout: float = 20.0) -> int:
+    if not pid_file.is_file():
+        raise ColibriM5Error(f"web PID file does not exist: {pid_file}")
+    try:
+        pid = int(pid_file.read_text(encoding="ascii").strip())
+    except (OSError, ValueError) as exc:
+        raise ColibriM5Error(f"invalid web PID file: {pid_file}") from exc
+    command = _guard_process_command(pid)
+    if "run_colibri_m5.py" not in command or "--web" not in command:
+        raise ColibriM5Error(
+            f"refusing to signal PID {pid}; it is not a guarded Colibri web monitor"
+        )
+    os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _guard_process_command(pid):
+            pid_file.unlink(missing_ok=True)
+            print(f"guarded Colibri web monitor stopped: PID {pid}")
+            return 0
+        time.sleep(0.25)
+    raise ColibriM5Error(
+        f"web monitor PID {pid} did not stop within {timeout:.0f}s"
+    )
 
 
 def _first_existing(paths: Sequence[Path]) -> Path:
@@ -367,10 +503,11 @@ def build_parser() -> argparse.ArgumentParser:
     default_usage_profile = (
         project_root / "profiles/glm-5.2-colibri-usage-259200.txt"
     )
+    runtime_dir = project_root / "runtime"
     parser = argparse.ArgumentParser(
         description="Run Colibri's GLM-5.2 Metal path with M5 Max 128 GiB guards."
     )
-    parser.add_argument("prompt")
+    parser.add_argument("prompt", nargs="?", default="")
     parser.add_argument("--engine", type=Path, default=default_engine)
     parser.add_argument("--model", type=Path, default=default_model)
     parser.add_argument(
@@ -407,12 +544,48 @@ def build_parser() -> argparse.ArgumentParser:
         default=M5_MIN_PRESSURE_FREE_PERCENT,
     )
     parser.add_argument("--sample-seconds", type=float, default=2.0)
+    parser.add_argument(
+        "--web",
+        action="store_true",
+        help="serve Colibri's browser chat UI instead of one prompt",
+    )
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--detach",
+        action="store_true",
+        help="run the guarded web monitor in the background",
+    )
+    parser.add_argument(
+        "--stop-web",
+        action="store_true",
+        help="stop the detached guarded web monitor and its model process",
+    )
+    parser.add_argument(
+        "--pid-file",
+        type=Path,
+        default=runtime_dir / "colibri-web.pid",
+    )
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=runtime_dir / "colibri-web.log",
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = build_parser().parse_args(raw_argv)
+    pid_file = args.pid_file.expanduser().resolve()
+    log_file = args.log_file.expanduser().resolve()
+    if args.stop_web:
+        try:
+            return stop_detached_web(pid_file)
+        except (ColibriM5Error, OSError, subprocess.SubprocessError) as exc:
+            print(f"run_colibri_m5: {exc}", file=sys.stderr)
+            return 2
     usage_profile = args.usage_profile or args.model / ".coli_usage"
     config = LaunchConfig(
         engine=args.engine.expanduser().resolve(),
@@ -425,28 +598,51 @@ def main(argv: Sequence[str] | None = None) -> int:
         temperature=args.temperature,
         profile=args.profile,
         mode=args.mode,
+        interface=WEB_INTERFACE if args.web else RUN_INTERFACE,
+        host=args.host,
+        port=args.port,
     )
     try:
         validate_launch(config)
+        if args.detach:
+            if config.interface != WEB_INTERFACE:
+                raise ColibriM5Error("--detach requires --web")
+            return start_detached_web(
+                raw_argv,
+                pid_file=pid_file,
+                log_file=log_file,
+            )
         if args.dry_run:
             print(" ".join(colibri_command(config)))
             for key, value in sorted(colibri_environment(config, {}).items()):
                 print(f"{key}={value}")
             return 0
-        return run_guarded(
-            config,
-            max_rss_gib=args.max_rss_gib,
-            min_start_available_gib=args.min_start_available_gib,
-            min_pressure_free_percent=args.min_pressure_free_percent,
-            sample_seconds=args.sample_seconds,
-            preserve_usage=args.preserve_usage,
-            reset_runtime_usage=args.reset_runtime_usage,
-            capture_usage=(
-                args.capture_usage.expanduser().resolve()
-                if args.capture_usage is not None
-                else None
-            ),
-        )
+        try:
+            return run_guarded(
+                config,
+                max_rss_gib=args.max_rss_gib,
+                min_start_available_gib=args.min_start_available_gib,
+                min_pressure_free_percent=args.min_pressure_free_percent,
+                sample_seconds=args.sample_seconds,
+                preserve_usage=args.preserve_usage,
+                reset_runtime_usage=args.reset_runtime_usage,
+                capture_usage=(
+                    args.capture_usage.expanduser().resolve()
+                    if args.capture_usage is not None
+                    else None
+                ),
+            )
+        finally:
+            if config.interface == WEB_INTERFACE:
+                try:
+                    if (
+                        pid_file.is_file()
+                        and int(pid_file.read_text(encoding="ascii").strip())
+                        == os.getpid()
+                    ):
+                        pid_file.unlink()
+                except (OSError, ValueError):
+                    pass
     except (ColibriM5Error, OSError, subprocess.SubprocessError) as exc:
         print(f"run_colibri_m5: {exc}", file=sys.stderr)
         return 2

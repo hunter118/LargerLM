@@ -13,6 +13,7 @@ This is experimental research code, not a production inference engine.
 | --- | ---: | --- | ---: |
 | `quality` | `2.69 tok/s` over 256 tokens | Original GLM top-8 | `96.95 GiB` |
 | `experimental-fast` | `4.92 tok/s` over 64 tokens | Cache-aware `J=2, M=32` | `96.31 GiB` |
+| `experimental-fast` Web | `5.31 tok/s` over 64 tokens | Single-slot persistent API | about `97 GiB` |
 
 The fast mode reached `5.21 tok/s` over its first 32 tokens on the
 power-constrained test machine. It changes about 35% of routed expert slots and
@@ -42,6 +43,26 @@ Download the supported model:
 hf download mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp \
   --local-dir artifacts/colibri-glm5.2-int4
 ```
+
+## Web Chat
+
+Build Colibri's official UI, then start the guarded loopback-only server:
+
+```bash
+./scripts/setup_colibri_web.sh
+.venv/bin/python scripts/run_colibri_m5.py \
+  --web --detach --mode experimental-fast --profile --preserve-usage
+```
+
+Open [http://127.0.0.1:8000](http://127.0.0.1:8000). Stop the model and release
+its memory with:
+
+```bash
+.venv/bin/python scripts/run_colibri_m5.py --stop-web
+```
+
+The UI is persistent between questions. Its headline speed includes prefill and
+time to first token; the Performance view reports decode throughput separately.
 
 Run with the original model routing:
 

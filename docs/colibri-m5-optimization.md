@@ -93,6 +93,37 @@ the recommended preset.
 The generated Chinese sample remained coherent, but one prompt is not a quality
 evaluation. Fast mode must be treated as an approximate model variant.
 
+### Persistent Web Decode
+
+Colibri's OpenAI-compatible server normally sends even one active request
+through its ragged multi-slot decode function. That path cannot use the
+contiguous full-layer Metal kernel, so a single-user browser session was slower
+than the command-line runner.
+
+The included patch specializes the `one configured slot, one active request`
+case. It binds that slot's KV cache and uses the same contiguous decode step as
+the command-line path. Multi-user and multi-slot requests retain Colibri's
+original ragged batching behavior.
+
+A real 26-token Chinese prompt followed by 64 generated tokens measured:
+
+| Metric | Result |
+| --- | ---: |
+| Decode throughput | `5.31 tok/s` |
+| Decode wall time | `12.063 s` |
+| UI end-to-end rate | `3.6 tok/s` |
+| Time to first token | `5.6 s` |
+| Expert disk service | `6.009 s` |
+| Expert I/O wait | `4.219 s` |
+| Expert matmul | `3.714 s` |
+| Attention | `3.534 s` |
+
+The UI rate includes prompt prefill and first-token latency; it is not directly
+comparable to decode-only measurements. The server is intentionally configured
+with one KV slot and one queued request because this machine is optimized for
+one interactive user and because additional simultaneous contexts increase
+memory risk.
+
 ## M5 Neural Acceleration
 
 The repository separately validates MPP TensorOps and can use the system MPP
@@ -171,6 +202,36 @@ Experimental fast mode:
   --mode experimental-fast --ngen 128 --profile
 ```
 
+### Browser Chat
+
+Build the official Colibri React interface after the main setup:
+
+```bash
+./scripts/setup_colibri_web.sh
+```
+
+Start a persistent, guarded model process:
+
+```bash
+.venv/bin/python scripts/run_colibri_m5.py \
+  --web --detach --mode experimental-fast --ngen 512 \
+  --profile --preserve-usage --sample-seconds 1
+```
+
+Open `http://127.0.0.1:8000`. The launcher only accepts loopback addresses, sets
+one KV slot and one request queue slot, and keeps the model loaded across
+questions. The browser's maximum-output control limits each answer; `128` is a
+reasonable interactive starting point.
+
+Stop the complete guarded process group and release about 97 GiB:
+
+```bash
+.venv/bin/python scripts/run_colibri_m5.py --stop-web
+```
+
+The detached monitor writes `runtime/colibri-web.log` and
+`runtime/colibri-web.pid`. `runtime/` is excluded from Git.
+
 Useful options:
 
 - `--usage-profile PATH` selects a learned placement snapshot.
@@ -185,6 +246,9 @@ The launcher also requires 24 GiB of reclaimable memory before starting. It
 samples the entire Colibri process group, sends an interrupt on a guard breach,
 then escalates to termination only if needed. This cannot make all macOS memory
 failures impossible, but it is materially safer than an unbounded GUI launch.
+The same monitor owns the detached Web child process, handles termination
+signals, and refuses to stop a PID whose command line does not match the
+guarded launcher.
 
 ## Verification
 

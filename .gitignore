@@ -12,6 +12,7 @@ experts/
 packed_experts/
 packed_experts_*/
 third_party/colibri/
+runtime/
 
 # Local build outputs.
 metal/glm_moe_infer
